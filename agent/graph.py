@@ -15,7 +15,7 @@ def create_workflow_graph():
     """Create and return the workflow graph with conditional routing"""
     # Initialize graph
     graph_builder = StateGraph(AgentState)
-    
+
     # Add nodes
     graph_builder.add_node("swe_architect", swe_architect)
     graph_builder.add_node("swe_developer", swe_developer)
@@ -26,4 +26,19 @@ def create_workflow_graph():
 
     return graph_builder
 
-swe_agent = create_workflow_graph().compile().with_config({"tags":["agent-v1"], "recursion_limit": 200})
+# Exported for the benchmark harnesses, which compile it themselves with a
+# checkpointer -- the same shape as ODR's `deep_researcher_builder`.
+swe_agent_builder = create_workflow_graph()
+
+# `_is_root=True` is a fork-only kwarg (langgraph-dev, branch
+# Prediction-SWEbench). It is what makes the compiler walk this graph *and its
+# subgraphs* to build `prompt_composition` and `transition_prediction`, the
+# metadata the prefetch predictor runs on. The two subgraphs are already
+# compiled at import time above, which is the order the analyser needs -- see
+# plan/02-required-changes.md.
+#
+# On stock langgraph this raises TypeError; that is intentional. The workload
+# has no meaning without the fork.
+swe_agent = swe_agent_builder.compile(_is_root=True).with_config(
+    {"tags": ["agent-v1"], "recursion_limit": 200}
+)

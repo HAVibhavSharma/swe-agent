@@ -10,3 +10,9 @@ class SoftwareArchitectState(BaseModel):
     implementation_plan: Optional[ImplementationPlan] = Field(None, description="The implementation plan to be executed")
     implementation_research_scratchpad: Annotated[list[AnyMessage], add_messages] = Field([], description="The scratchpad for implementation research")
     is_valid_research_step: Optional[bool] = Field(None, description="Whether the research step is valid")
+    # Loop counters. Both are read by the routers against `Configuration`
+    # limits, which is the shape the fork's compile-time analyser turns into a
+    # `state_over_config_limit` prediction rule -- see
+    # agent/common/configuration.py for why the names are ODR's.
+    research_iterations: int = Field(0, description="Completed `conduct_research` turns")
+    tool_call_iterations: int = Field(0, description="Consecutive tool round-trips in the research react loop")

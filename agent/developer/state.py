@@ -33,3 +33,7 @@ class SoftwareDeveloperState(BaseModel):
     atomic_implementation_research: Annotated[list[AnyMessage], add_messages_with_clear]
     codebase_structure: Optional[str] = Field(None, description="The codebase structure")
     current_file_content: Optional[str] = Field(None, description="The current content of the file being edited")
+    # Loop counters, read by the routers against `Configuration` limits. See
+    # agent/common/configuration.py.
+    tool_call_iterations: int = Field(0, description="Tool round-trips in the current atomic task's research loop")
+    atomic_tasks_done: int = Field(0, description="Atomic tasks completed across the whole instance")

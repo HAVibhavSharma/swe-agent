@@ -1,0 +1,10 @@
+# A hand-built instance set: same repo, so every job shares the gitingest repo
+# tree and much of the file content. The benchmark's own sample is deliberately
+# spread across repos, which makes cross-instance KV reuse ~0 by construction;
+# a set like this is what shows whether the cache can exploit shared content at
+# all. Fields match SWE-bench's schema, so `swebench eval` still scores it.
+#
+# Fill base_commit/problem_statement from the dataset, e.g.
+#   python -c "from swebench.harness.utils import load_swebench_dataset as l; \
+#     import json; [print(json.dumps({k: d[k] for k in ('instance_id','repo','base_commit','problem_statement')})) \
+#     for d in l('SWE-bench/SWE-bench_Verified','test') if d['repo']=='astropy/astropy'][:6]"
