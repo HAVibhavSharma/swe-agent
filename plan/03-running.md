@@ -8,7 +8,10 @@ the final scoring step, which can run anywhere.
 ```bash
 cd ~/Projects/swe-agent
 uv venv --python 3.12 && source .venv/bin/activate
-uv pip install -e .
+
+# This repo's own deps only -- do NOT `pip install -e .`, see the note below.
+uv pip install langchain-anthropic langgraph-cli[inmem] langsmith gitingest \
+  tree-sitter-languages tree-sitter==0.21.3 diff-match-patch thefuzz fuzzysearch
 
 # REQUIRED: the fork. Stock langgraph has no `_vllm_agent`, no `_kv_forecast`
 # and no `_is_root` kwarg, and `agent/graph.py` will not import without them.
@@ -22,6 +25,19 @@ pip install langchain-openai transformers
 
 cp env.template .env    # then fill it in
 ```
+
+**Why not `pip install -e .`.** `pyproject.toml` here declares only `[project]`
+— no `[build-system]`, no packages config — and the repo is a flat layout with
+six top-level directories (`agent`, `helpers`, `plan`, `scripts`, `static`,
+`tests`), only one of which (`agent`) has an `__init__.py`. Setuptools'
+flat-layout auto-discovery refuses that. Installing is not needed anyway: every
+harness is run as `python -m tests.<name>` **from the repo root**, which puts
+the root on `sys.path` so `import agent` and `import helpers` resolve.
+
+Run from the repo root regardless of how you invoke it — the agent hard-codes
+`./workspace_repo`, which is resolved against the current working directory.
+`python tests/run_evaluate.py` (script form) does *not* work: it puts `tests/`
+on `sys.path` instead of the root, and `import agent` fails.
 
 Check the fork is the branch you think it is:
 
@@ -76,7 +92,7 @@ The first instance of each repo clones it from GitHub into
 network clone to a latency number. Pre-clone by running the cold phase once:
 
 ```bash
-python tests/run_evaluate.py --max-instances 6 --completions-per-instance 0 \
+python -m tests.run_evaluate --max-instances 6 --completions-per-instance 0 \
   --cold-instances-per-query 1
 ```
 
@@ -85,21 +101,21 @@ python tests/run_evaluate.py --max-instances 6 --completions-per-instance 0 \
 ```bash
 # control: no prefetch
 LANGGRAPH_VLLM_AGENT_ENABLE=0 \
-python tests/run_evaluate.py --max-instances 6 --completions-per-instance 3 \
+python -m tests.run_evaluate --max-instances 6 --completions-per-instance 3 \
   --ablation-mode baseline
 
 # treatment: prefetch on
 LANGGRAPH_VLLM_AGENT_ENABLE=1 \
 LANGGRAPH_VLLM_AGENT_BASE_URL=http://localhost:8000/v1/agents \
-python tests/run_evaluate.py --max-instances 6 --completions-per-instance 3 \
+python -m tests.run_evaluate --max-instances 6 --completions-per-instance 3 \
   --ablation-mode full
 
 # how much prefix is there to warm at all
-python tests/run_evaluate_prefix.py --max-instances 6 --completions-per-instance 3
+python -m tests.run_evaluate_prefix --max-instances 6 --completions-per-instance 3
 
 # node-aware eviction (clears the prefetch env itself)
 KV_FORECAST_REDIS_URL=redis://localhost:6379/0 \
-python tests/run_evaluate_node_eviction.py --max-instances 6 --completions-per-instance 3
+python -m tests.run_evaluate_node_eviction --max-instances 6 --completions-per-instance 3
 ```
 
 Both arms must use the same instances. The sampler is

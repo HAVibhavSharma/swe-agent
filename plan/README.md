@@ -26,9 +26,9 @@ cp env.template .env                                     # then fill it in
 
 python diag_prediction.py                                # is the chain wired?
 
-python tests/run_evaluate.py --max-instances 6 --completions-per-instance 3
-python tests/run_evaluate_prefix.py --max-instances 6
-python tests/run_evaluate_node_eviction.py --max-instances 6
+python -m tests.run_evaluate --max-instances 6 --completions-per-instance 3
+python -m tests.run_evaluate_prefix --max-instances 6
+python -m tests.run_evaluate_node_eviction --max-instances 6
 ```
 
 ## Status, honestly
