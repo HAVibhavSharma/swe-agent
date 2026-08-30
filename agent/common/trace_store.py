@@ -696,7 +696,12 @@ TraceTransport = AsyncTraceTransport
 
 
 _client: httpx.AsyncClient | None = None
+# The one that carries this repo's traffic: every node is a plain `def` calling
+# `runnable.invoke(...)`, so LangGraph runs it in a worker thread and ChatOpenAI
+# uses its *sync* client. Wiring only the async half records nothing.
+_sync_client: httpx.Client | None = None
 _client_lock = threading.Lock()
+_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
 
 
 def get_http_client() -> httpx.AsyncClient | None:
@@ -707,11 +712,22 @@ def get_http_client() -> httpx.AsyncClient | None:
     with _client_lock:
         if _client is None:
             _client = httpx.AsyncClient(
-                transport=TraceTransport(),
-                timeout=httpx.Timeout(600.0, connect=30.0),
+                transport=AsyncTraceTransport(), timeout=_TIMEOUT
             )
-            print(f"[trace] transport attached ({describe()})", flush=True)
+            print(f"[trace] async transport attached ({describe()})", flush=True)
         return _client
+
+
+def get_sync_http_client() -> httpx.Client | None:
+    """Shared sync httpx client wired to the trace transport, None when off."""
+    global _sync_client
+    if not enabled():
+        return None
+    with _client_lock:
+        if _sync_client is None:
+            _sync_client = httpx.Client(transport=SyncTraceTransport(), timeout=_TIMEOUT)
+            print(f"[trace] sync transport attached ({describe()})", flush=True)
+        return _sync_client
 
 
 def describe() -> str:
