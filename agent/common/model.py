@@ -28,6 +28,7 @@ import os
 from langchain.chat_models import init_chat_model
 from langchain_core.runnables import RunnableConfig
 
+from agent.common import trace_store
 from agent.common.configuration import Configuration
 from agent.common.llm_request_metadata import inject_langgraph_request_metadata
 
@@ -83,6 +84,9 @@ configurable_model = init_chat_model(
         "extra_body",
         "stream_usage",
         "seed",
+        # Fixed-trace study: lets get_model_config() swap in the record/replay
+        # httpx client per call without rebuilding the model.
+        "http_async_client",
     ),
 )
 
@@ -144,6 +148,13 @@ def get_model_config(
         seed = Configuration.from_runnable_config(config).seed
         if seed is not None:
             model_config["seed"] = seed
+
+        # Fixed-trace study: route model traffic through the record/replay
+        # transport. Returns None (and changes nothing) unless SWE_TRACE_MODE
+        # (or ODR_TRACE_MODE) is set. See agent/common/trace_store.py.
+        trace_client = trace_store.get_http_client()
+        if trace_client is not None:
+            model_config["http_async_client"] = trace_client
     return model_config
 
 

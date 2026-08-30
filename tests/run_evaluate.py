@@ -29,6 +29,7 @@ import asyncio
 from langgraph.checkpoint.memory import MemorySaver
 
 from agent.graph import swe_agent_builder
+from agent.common import trace_store
 from agent.common.model import MODEL_NAME, MODEL_PROVIDER
 
 try:
@@ -251,6 +252,34 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Keep the cold phase's blocks resident in GPU HBM instead of "
             "evicting them at the phase boundary."
+        ),
+    )
+    parser.add_argument(
+        "--trace-mode",
+        choices=("off", "record", "pinned", "offline"),
+        default=None,
+        help=(
+            "Fixed-trace study (agent/common/trace_store.py). record: dump every "
+            "chat-completion request/response to --trace-path. pinned: issue the "
+            "live call for timing but hand the agent the recorded response. "
+            "offline: replay without touching the server. Overrides "
+            "SWE_TRACE_MODE / ODR_TRACE_MODE."
+        ),
+    )
+    parser.add_argument(
+        "--trace-path",
+        type=Path,
+        default=None,
+        help="Trace JSONL, written in record mode and read in pinned/offline. "
+             "Overrides SWE_TRACE_PATH / ODR_TRACE_PATH.",
+    )
+    parser.add_argument(
+        "--no-prefetch",
+        action="store_true",
+        help=(
+            "Clear LANGGRAPH_VLLM_AGENT_ENABLE / _BASE_URL for this run, after "
+            ".env has been loaded. The baseline arm -- and what a `record` run "
+            "should use, so the trace is a stock-stack trajectory."
         ),
     )
     parser.add_argument(
@@ -704,6 +733,22 @@ async def _run_warm_phase(
 async def main():
     global ABLATION_MODE, EXPERIMENT_NAME
     args = parse_args()
+
+    # Both after load_dotenv(override=True), which is why they cannot be done
+    # by exporting in the shell: a value in .env would win over the export.
+    if args.trace_mode:
+        os.environ["SWE_TRACE_MODE"] = args.trace_mode
+    if args.trace_path:
+        os.environ["SWE_TRACE_PATH"] = str(args.trace_path)
+    if args.no_prefetch:
+        # `vllm_agent_enabled()` is true if _ENABLE == "1" OR _BASE_URL is set,
+        # so both have to go.
+        os.environ["LANGGRAPH_VLLM_AGENT_ENABLE"] = "0"
+        os.environ.pop("LANGGRAPH_VLLM_AGENT_BASE_URL", None)
+
+    # Resolves and validates the trace config once, here, rather than inside the
+    # first model call where a bad path surfaces as a fake connection error.
+    print(trace_store.describe())
 
     if args.pseudo_dynamic:
         os.environ["LANGGRAPH_PROMPT_PSEUDO_DYNAMIC"] = (
