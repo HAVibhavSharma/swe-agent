@@ -99,6 +99,9 @@ class TraceConfig:
     path: str
     on_miss: str
     report_path: Path | None
+    # Where the side-by-side dumps go when a pinned live call stops before the
+    # baseline's token count. One file per such request.
+    early_exit_dir: Path | None
 
 
 _config: TraceConfig | None = None
@@ -147,7 +150,7 @@ def _resolve() -> TraceConfig:
     path = _env("TRACE_PATH")
     on_miss = (_env("TRACE_ON_MISS", "live") or "live").lower()
     if mode == "off":
-        return TraceConfig(mode, path, on_miss, None)
+        return TraceConfig(mode, path, on_miss, None, None)
 
     if not path:
         raise ValueError(f"TRACE_MODE={mode} requires SWE_TRACE_PATH to be set")
@@ -179,7 +182,13 @@ def _resolve() -> TraceConfig:
         if report
         else trace_path.with_name(trace_path.stem + ".divergence.jsonl")
     )
-    return TraceConfig(mode, path, on_miss, report_path)
+    early_exit = _env("TRACE_EARLY_EXIT_DIR")
+    early_exit_dir = (
+        Path(early_exit)
+        if early_exit
+        else trace_path.with_name(trace_path.stem + ".early_exits")
+    )
+    return TraceConfig(mode, path, on_miss, report_path, early_exit_dir)
 
 
 def enabled() -> bool:
@@ -286,6 +295,9 @@ class _TraceTransportBase:
         self._report_path = cfg.report_path or self._trace_path.with_name(
             self._trace_path.stem + ".divergence.jsonl"
         )
+        self._early_exit_dir = cfg.early_exit_dir or self._trace_path.with_name(
+            self._trace_path.stem + ".early_exits"
+        )
         self._store = TraceStore(cfg.path) if self._mode in {"pinned", "offline"} else None
         self._write_lock = threading.Lock()
 
@@ -351,6 +363,102 @@ class _TraceTransportBase:
         except Exception as exc:  # noqa: BLE001 - diagnosis is best-effort
             return f"unparseable response body: {exc}"[:500]
         return None
+
+    def _message_text(self, body_text: str, is_stream: bool) -> str | None:
+        """The assistant text a response carries, for eyeballing two of them.
+
+        Best-effort and deliberately lossy: it is the field a human compares,
+        while the raw bodies alongside it are what survives when the shape is
+        something this does not know about (tool calls, reasoning content).
+        """
+        try:
+            if not is_stream:
+                message = json.loads(body_text)["choices"][0].get("message") or {}
+                return message.get("content")
+            parts: list[str] = []
+            for line in body_text.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload.strip() == "[DONE]":
+                    continue
+                delta = (json.loads(payload).get("choices") or [{}])[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    parts.append(piece)
+            return "".join(parts)
+        except Exception:  # noqa: BLE001 - the raw bodies are the fallback
+            return None
+
+    def _dump_early_exit(
+        self,
+        *,
+        key: str,
+        job_id: str,
+        body: dict[str, Any],
+        entry: dict[str, Any],
+        is_stream: bool,
+        live_text: str,
+        live_status: int | None,
+        live_completion_tokens: int | None,
+        pinned_limit: int | None,
+        elapsed_ns: int,
+    ) -> Path:
+        """Both outputs for one request, side by side, in one JSON file.
+
+        Written only when the live call stopped short of the baseline's token
+        count. The agent is handed the recording and the live output is thrown
+        away, so without this the two are never comparable: an early exit is
+        exactly the case where the live call decoded something *different*, and
+        the divergence report can only say that it was shorter.
+        """
+        node = body.get("langgraph_node")
+        name = f"{key[:12]}_job{job_id}"
+        if isinstance(node, str) and node:
+            name = f"{name}_{node}"
+        path = self._early_exit_dir / f"{name}.json"
+        # A key can legitimately repeat (retries, the same brief twice); keep
+        # every occurrence rather than overwriting the first.
+        with self._write_lock:
+            self._early_exit_dir.mkdir(parents=True, exist_ok=True)
+            suffix = 1
+            while path.exists():
+                suffix += 1
+                path = self._early_exit_dir / f"{name}.{suffix}.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "key": key,
+                        "job_id": job_id,
+                        "langgraph_node": node,
+                        "call_type": body.get("call_type"),
+                        "model": body.get("model"),
+                        "stream": is_stream,
+                        "reason": "early_exit",
+                        "pinned_max_tokens": pinned_limit,
+                        "live_completion_tokens": live_completion_tokens,
+                        "live_status": live_status,
+                        "live_latency_ns": elapsed_ns,
+                        "baseline_latency_ns": entry.get("record_latency_ns"),
+                        # What the agent was given, and what the live call
+                        # produced instead. Text first because that is what a
+                        # human reads; the raw bodies keep whatever the text
+                        # extraction dropped.
+                        "recorded_text": self._message_text(
+                            entry["response_body"], bool(entry.get("stream", is_stream))
+                        ),
+                        "live_text": self._message_text(live_text, is_stream),
+                        "recorded_response_body": entry["response_body"],
+                        "live_response_body": live_text,
+                        "request_body": body,
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return path
 
     # -- shared steps ----------------------------------------------------
     def _parse(self, raw: bytes) -> dict[str, Any] | None:
@@ -468,6 +576,7 @@ class _TraceTransportBase:
         *,
         key: str,
         job_id: str,
+        body: dict[str, Any],
         entry: dict[str, Any],
         is_stream: bool,
         live_text: str | None,
@@ -495,6 +604,32 @@ class _TraceTransportBase:
             ):
                 live_error = f"HTTP {live_status}: {live_text[:400]}"
 
+        # "Early exit": the live call hit EOS before the cap, so it decoded
+        # fewer tokens than the baseline did -- the one case where the discarded
+        # live output is known to differ from the recording the agent got.
+        early_exit_path: Path | None = None
+        if (
+            live_text is not None
+            and live_completion_tokens is not None
+            and pinned_limit is not None
+            and live_completion_tokens < pinned_limit
+        ):
+            try:
+                early_exit_path = self._dump_early_exit(
+                    key=key,
+                    job_id=job_id,
+                    body=body,
+                    entry=entry,
+                    is_stream=is_stream,
+                    live_text=live_text,
+                    live_status=live_status,
+                    live_completion_tokens=live_completion_tokens,
+                    pinned_limit=pinned_limit,
+                    elapsed_ns=elapsed_ns,
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics, never fatal
+                logger.warning("Could not write early-exit dump: %s", exc)
+
         if live_error:
             logger.warning(
                 "Pinned live call reported an error (job=%s key=%s status=%s): %s",
@@ -520,6 +655,9 @@ class _TraceTransportBase:
                 "live_completion_tokens": live_completion_tokens,
                 "live_error": live_error,
                 "baseline_latency_ns": entry.get("record_latency_ns"),
+                # Set when the live call stopped short: the file holding both
+                # outputs for this request.
+                "early_exit_json": str(early_exit_path) if early_exit_path else None,
             },
         )
 
@@ -599,6 +737,7 @@ class AsyncTraceTransport(_TraceTransportBase, httpx.AsyncBaseTransport):
         self._report_pinned(
             key=key,
             job_id=job_id,
+            body=body,
             entry=entry,
             is_stream=is_stream,
             live_text=live_text,
@@ -680,6 +819,7 @@ class SyncTraceTransport(_TraceTransportBase, httpx.BaseTransport):
         self._report_pinned(
             key=key,
             job_id=job_id,
+            body=body,
             entry=entry,
             is_stream=is_stream,
             live_text=live_text,
