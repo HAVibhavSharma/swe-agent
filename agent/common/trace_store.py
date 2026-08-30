@@ -65,8 +65,12 @@ logger = logging.getLogger(__name__)
 
 VALID_MODES = {"off", "record", "pinned", "offline"}
 
-# Where the early-exit dumps land, relative to the working directory.
+# Where the side-by-side dumps land, relative to the working directory. Two
+# folders, because the interesting half is the one that ended early: a live call
+# that ran to the cap decoded as much as the baseline, while one that stopped
+# short decoded something else.
 EARLY_EXIT_DIRNAME = "trace_early_exits"
+FULL_LENGTH_DIRNAME = "trace_full_length"
 
 # Request fields that identify the *work* being asked for. Everything else
 # (job_id, thread_id, agent id, streaming plumbing) varies run to run without
@@ -102,10 +106,11 @@ class TraceConfig:
     path: str
     on_miss: str
     report_path: Path | None
-    # Where the side-by-side dumps go when a pinned live call stops before the
-    # baseline's token count. One file per such request, under the working
-    # directory.
+    # Where the side-by-side dumps go, one file per pinned request, under the
+    # working directory: `early_exit_dir` when the live call stopped before the
+    # baseline's token count, `full_length_dir` for every other pinned request.
     early_exit_dir: Path | None
+    full_length_dir: Path | None
 
 
 _config: TraceConfig | None = None
@@ -154,7 +159,7 @@ def _resolve() -> TraceConfig:
     path = _env("TRACE_PATH")
     on_miss = (_env("TRACE_ON_MISS", "live") or "live").lower()
     if mode == "off":
-        return TraceConfig(mode, path, on_miss, None, None)
+        return TraceConfig(mode, path, on_miss, None, None, None)
 
     if not path:
         raise ValueError(f"TRACE_MODE={mode} requires SWE_TRACE_PATH to be set")
@@ -192,7 +197,13 @@ def _resolve() -> TraceConfig:
     # these dumps belong to the run that produced them rather than to the
     # recording every arm shares.
     early_exit_dir = Path(early_exit) if early_exit else Path.cwd() / EARLY_EXIT_DIRNAME
-    return TraceConfig(mode, path, on_miss, report_path, early_exit_dir)
+    full_length = _env("TRACE_FULL_DUMP_DIR")
+    full_length_dir = (
+        Path(full_length) if full_length else Path.cwd() / FULL_LENGTH_DIRNAME
+    )
+    return TraceConfig(
+        mode, path, on_miss, report_path, early_exit_dir, full_length_dir
+    )
 
 
 def enabled() -> bool:
@@ -300,6 +311,7 @@ class _TraceTransportBase:
             self._trace_path.stem + ".divergence.jsonl"
         )
         self._early_exit_dir = cfg.early_exit_dir or Path.cwd() / EARLY_EXIT_DIRNAME
+        self._full_length_dir = cfg.full_length_dir or Path.cwd() / FULL_LENGTH_DIRNAME
         self._store = TraceStore(cfg.path) if self._mode in {"pinned", "offline"} else None
         self._write_lock = threading.Lock()
 
@@ -392,9 +404,11 @@ class _TraceTransportBase:
         except Exception:  # noqa: BLE001 - the raw bodies are the fallback
             return None
 
-    def _dump_early_exit(
+    def _dump_pinned_pair(
         self,
         *,
+        directory: Path,
+        reason: str,
         key: str,
         job_id: str,
         body: dict[str, Any],
@@ -408,25 +422,26 @@ class _TraceTransportBase:
     ) -> Path:
         """Both outputs for one request, side by side, in one JSON file.
 
-        Written only when the live call stopped short of the baseline's token
-        count. The agent is handed the recording and the live output is thrown
-        away, so without this the two are never comparable: an early exit is
-        exactly the case where the live call decoded something *different*, and
-        the divergence report can only say that it was shorter.
+        The agent is handed the recording and the live output is thrown away, so
+        without this the two are never comparable. ``reason`` says which folder
+        this one belongs in: ``early_exit`` when the live call stopped before
+        the baseline's token count -- the case where it is known to have decoded
+        something different -- and ``full_length`` / ``unknown_length`` for the
+        rest, kept separately so the interesting set stays small.
         """
         node = body.get("langgraph_node")
         name = f"{key[:12]}_job{job_id}"
         if isinstance(node, str) and node:
             name = f"{name}_{node}"
-        path = self._early_exit_dir / f"{name}.json"
+        path = directory / f"{name}.json"
         # A key can legitimately repeat (retries, the same brief twice); keep
         # every occurrence rather than overwriting the first.
         with self._write_lock:
-            self._early_exit_dir.mkdir(parents=True, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
             suffix = 1
             while path.exists():
                 suffix += 1
-                path = self._early_exit_dir / f"{name}.{suffix}.json"
+                path = directory / f"{name}.{suffix}.json"
             path.write_text(
                 json.dumps(
                     {
@@ -436,7 +451,7 @@ class _TraceTransportBase:
                         "call_type": body.get("call_type"),
                         "model": body.get("model"),
                         "stream": is_stream,
-                        "reason": "early_exit",
+                        "reason": reason,
                         "pinned_max_tokens": pinned_limit,
                         "live_completion_tokens": live_completion_tokens,
                         "live_status": live_status,
@@ -606,18 +621,35 @@ class _TraceTransportBase:
             ):
                 live_error = f"HTTP {live_status}: {live_text[:400]}"
 
-        # "Early exit": the live call hit EOS before the cap, so it decoded
-        # fewer tokens than the baseline did -- the one case where the discarded
-        # live output is known to differ from the recording the agent got.
-        early_exit_path: Path | None = None
-        if (
-            live_text is not None
-            and live_completion_tokens is not None
-            and pinned_limit is not None
-            and live_completion_tokens < pinned_limit
-        ):
+        # Every pinned request gets its two outputs written side by side, split
+        # across two folders. "early_exit" is the live call that hit EOS before
+        # the cap, so it decoded fewer tokens than the baseline -- the case
+        # where the discarded output is known to differ. The rest go elsewhere
+        # so that set stays small and readable.
+        dump_path: Path | None = None
+        dump_reason: str | None = None
+        if live_text is not None:
+            if (
+                live_completion_tokens is not None
+                and pinned_limit is not None
+                and live_completion_tokens < pinned_limit
+            ):
+                dump_reason = "early_exit"
+                directory = self._early_exit_dir
+            else:
+                # Either it decoded exactly the cap, or the response carried no
+                # usage to say so (an aborted stream, usually). Both are "not
+                # early"; the reason keeps them apart inside the file.
+                dump_reason = (
+                    "full_length"
+                    if live_completion_tokens is not None
+                    else "unknown_length"
+                )
+                directory = self._full_length_dir
             try:
-                early_exit_path = self._dump_early_exit(
+                dump_path = self._dump_pinned_pair(
+                    directory=directory,
+                    reason=dump_reason,
                     key=key,
                     job_id=job_id,
                     body=body,
@@ -630,7 +662,7 @@ class _TraceTransportBase:
                     elapsed_ns=elapsed_ns,
                 )
             except Exception as exc:  # noqa: BLE001 - diagnostics, never fatal
-                logger.warning("Could not write early-exit dump: %s", exc)
+                logger.warning("Could not write pinned dump: %s", exc)
 
         if live_error:
             logger.warning(
@@ -657,9 +689,10 @@ class _TraceTransportBase:
                 "live_completion_tokens": live_completion_tokens,
                 "live_error": live_error,
                 "baseline_latency_ns": entry.get("record_latency_ns"),
-                # Set when the live call stopped short: the file holding both
-                # outputs for this request.
-                "early_exit_json": str(early_exit_path) if early_exit_path else None,
+                # The file holding both outputs for this request, and which
+                # bucket it went to: early_exit / full_length / unknown_length.
+                "dump_json": str(dump_path) if dump_path else None,
+                "dump_reason": dump_reason,
             },
         )
 
