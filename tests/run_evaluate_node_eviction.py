@@ -36,6 +36,7 @@ from agent.common.model import MODEL_NAME, MODEL_PROVIDER
 try:
     # `python tests/run_evaluate_node_eviction.py` puts tests/ on sys.path...
     from kv_metrics_reset import reset_kv_metrics
+    from system_prompt_population import populate_system_prompts
     from swebench_instances import (
         append_prediction,
         collect_patch,
@@ -47,6 +48,7 @@ try:
     )
 except ImportError:  # ...`python -m tests.run_evaluate_node_eviction` does not.
     from tests.kv_metrics_reset import reset_kv_metrics
+    from tests.system_prompt_population import populate_system_prompts
     from tests.swebench_instances import (
         append_prediction,
         collect_patch,
@@ -76,6 +78,10 @@ SUMMARY_PATH = METRICS_DIR / "instance_summary.jsonl"
 E2E_LATENCY_CSV_PATH = METRICS_DIR / "job_instance_e2e_latency.csv"
 PREDICTIONS_PATH = METRICS_DIR / "predictions.jsonl"
 KV_METRICS_RESET_PATH = METRICS_DIR / "kv_metrics_reset.json"
+# Per-node outcome of the seeding phase. Kept with the run it belongs to: a warm
+# phase that never hits is explained by the node whose seed did not stick, and
+# nothing else in the report says which one that was.
+SYSTEM_PROMPT_POPULATION_PATH = METRICS_DIR / "system_prompt_population.json"
 PREDICTION_DIR = Path(__file__).resolve().parents[1] / "SWE_predictions" / RUN_ID
 os.environ["LANGGRAPH_PREDICTION_LOG_DIR"] = str(PREDICTION_DIR)
 
@@ -314,6 +320,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cold-instances-per-query", type=int, default=1)
     parser.add_argument("--skip-cold-phase", action="store_true")
+    parser.add_argument(
+        "--skip-system-prompt-population",
+        action="store_true",
+        help=(
+            "Do not seed vLLM's AgentPrefixRegistry in this process. For when a "
+            "separate invocation already seeded it -- the reset still fires "
+            "before the warm phase, so the boundary is still drawn."
+        ),
+    )
+    parser.add_argument(
+        "--system-prompt-population-top-k",
+        type=int,
+        default=None,
+        help=(
+            "prefetch_top_k sent with each seed. Omitted by default, which tells "
+            "the server to fan out over every prefix the agent has -- one, at "
+            "this point, since the registry starts empty."
+        ),
+    )
+    parser.add_argument(
+        "--no-prefill-on-miss",
+        dest="prefill_on_miss",
+        action="store_false",
+        help=(
+            "Seed the registry without prefilling. The lookup is warm and the "
+            "KV cache is not, so the warm phase's first visit to each node "
+            "still pays a full prefill -- see tests/system_prompt_population.py."
+        ),
+    )
+    parser.set_defaults(prefill_on_miss=True)
     parser.add_argument("--no-hbm-flush", action="store_true")
     parser.add_argument("--no-kv-metrics-reset", action="store_true")
     return parser.parse_args()
@@ -669,6 +705,7 @@ async def main():
 
     _reconcile_graph_spec()
     print(f"Metrics directory: {METRICS_DIR}")
+    print(f"System prompt population report: {SYSTEM_PROMPT_POPULATION_PATH}")
     print(f"Predictions JSONL: {PREDICTIONS_PATH}")
     print(f"Prediction logs directory: {PREDICTION_DIR}")
     print(f"vLLM request stats directory: {VLLM_STATS_DIR}")
@@ -684,6 +721,17 @@ async def main():
     print(
         f"Running {len(selected)} instances sequentially, "
         f"{args.completions_per_instance} run(s) each"
+    )
+    print(
+        "Phases: cold "
+        f"({0 if args.skip_cold_phase else args.cold_instances_per_query} "
+        "run(s) per instance) -> system prompt population "
+        f"({'SKIPPED' if args.skip_system_prompt_population else 'seeding'} "
+        "the AgentPrefixRegistry"
+        f"{'' if args.prefill_on_miss else ', registry only'}) "
+        "-> POST /v1/kv_metrics/reset"
+        f"{'' if args.no_hbm_flush else ' (+ HBM flush)'} "
+        "-> warm (measured)"
     )
 
     try:
@@ -701,7 +749,36 @@ async def main():
                     "partly filled for the warm phase"
                 )
 
+        # ---- system prompt population -------------------------------------
+        # One POST /v1/agents/prefetch per call site, each carrying that node's
+        # system prompt as `text`, so vLLM's AgentPrefixRegistry holds every
+        # prompt before the first real request exists. Fills the registry
+        # always, the KV cache only with prefill_on_miss -- see
+        # tests/system_prompt_population.py.
+        system_prompt_population: dict[str, Any] | None = None
+        if args.skip_system_prompt_population:
+            print("System prompt population: SKIPPED (--skip-system-prompt-population)")
+        else:
+            system_prompt_population = await populate_system_prompts(
+                label=f"system_prompt_population_{RUN_ID}",
+                top_k=args.system_prompt_population_top_k,
+                prefill_on_miss=args.prefill_on_miss,
+                record_to=SYSTEM_PROMPT_POPULATION_PATH,
+            )
+            if not system_prompt_population.get("ok"):
+                # A node whose seed did not stick prefills on every visit, not
+                # just the first, and that shows up in the warm phase as a miss
+                # with nothing to do with the policy under test.
+                print(
+                    "  WARNING: not every call site was seeded, so the registry "
+                    "is only partly populated for the warm phase"
+                )
+
         # ---- the boundary -------------------------------------------------
+        # Everything the server counted up to here -- the population phase's
+        # phantom requests, their LMCache misses, the epoch clock behind any
+        # rate -- belongs to the phase before the boundary, and this is what
+        # tells it so.
         kv_metrics_reset: dict[str, Any] | None = None
         if not args.no_kv_metrics_reset:
             kv_metrics_reset = await reset_kv_metrics(
@@ -731,6 +808,22 @@ async def main():
             "cold_runs": len(cold_rows),
             "cold_runs_failed": sum(1 for row in cold_rows if not row["success"]),
             "cold_phase_metrics_dir": str(COLD_METRICS_DIR),
+            "system_prompt_population_ok": bool(
+                system_prompt_population and system_prompt_population.get("ok")
+            ),
+            "system_prompt_population_seeded": (
+                system_prompt_population.get("nodes_seeded")
+                if system_prompt_population
+                else None
+            ),
+            "system_prompt_population_attempted": (
+                system_prompt_population.get("nodes_attempted")
+                if system_prompt_population
+                else None
+            ),
+            "system_prompt_population_json": (
+                str(SYSTEM_PROMPT_POPULATION_PATH) if system_prompt_population else None
+            ),
             "kv_metrics_reset_ok": bool(kv_metrics_reset and kv_metrics_reset.get("ok")),
             "kv_metrics_epoch": kv_metrics_reset.get("epoch") if kv_metrics_reset else None,
             "hbm_flushed": kv_metrics_reset.get("hbm_flushed") if kv_metrics_reset else None,
