@@ -78,3 +78,5 @@ coverage.xml
 .DS_Store
 .env.local
 workspace_repo/
+# Pinned-replay early-exit dumps (see agent/common/trace_store.py)
+trace_early_exits/

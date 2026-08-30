@@ -65,6 +65,9 @@ logger = logging.getLogger(__name__)
 
 VALID_MODES = {"off", "record", "pinned", "offline"}
 
+# Where the early-exit dumps land, relative to the working directory.
+EARLY_EXIT_DIRNAME = "trace_early_exits"
+
 # Request fields that identify the *work* being asked for. Everything else
 # (job_id, thread_id, agent id, streaming plumbing) varies run to run without
 # changing what the model is asked to do, so it must stay out of the key.
@@ -100,7 +103,8 @@ class TraceConfig:
     on_miss: str
     report_path: Path | None
     # Where the side-by-side dumps go when a pinned live call stops before the
-    # baseline's token count. One file per such request.
+    # baseline's token count. One file per such request, under the working
+    # directory.
     early_exit_dir: Path | None
 
 
@@ -183,11 +187,11 @@ def _resolve() -> TraceConfig:
         else trace_path.with_name(trace_path.stem + ".divergence.jsonl")
     )
     early_exit = _env("TRACE_EARLY_EXIT_DIR")
-    early_exit_dir = (
-        Path(early_exit)
-        if early_exit
-        else trace_path.with_name(trace_path.stem + ".early_exits")
-    )
+    # Under the working directory, not next to the trace: the trace usually
+    # lives on a shared data mount that is read-only to a run replaying it, and
+    # these dumps belong to the run that produced them rather than to the
+    # recording every arm shares.
+    early_exit_dir = Path(early_exit) if early_exit else Path.cwd() / EARLY_EXIT_DIRNAME
     return TraceConfig(mode, path, on_miss, report_path, early_exit_dir)
 
 
@@ -295,9 +299,7 @@ class _TraceTransportBase:
         self._report_path = cfg.report_path or self._trace_path.with_name(
             self._trace_path.stem + ".divergence.jsonl"
         )
-        self._early_exit_dir = cfg.early_exit_dir or self._trace_path.with_name(
-            self._trace_path.stem + ".early_exits"
-        )
+        self._early_exit_dir = cfg.early_exit_dir or Path.cwd() / EARLY_EXIT_DIRNAME
         self._store = TraceStore(cfg.path) if self._mode in {"pinned", "offline"} else None
         self._write_lock = threading.Lock()
 
