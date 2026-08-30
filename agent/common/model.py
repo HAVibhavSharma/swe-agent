@@ -85,7 +85,10 @@ configurable_model = init_chat_model(
         "stream_usage",
         "seed",
         # Fixed-trace study: lets get_model_config() swap in the record/replay
-        # httpx client per call without rebuilding the model.
+        # httpx clients per call without rebuilding the model. Both halves: the
+        # nodes here are sync `def`s calling `runnable.invoke(...)`, so their
+        # traffic goes through ChatOpenAI's *sync* client.
+        "http_client",
         "http_async_client",
     ),
 )
@@ -152,9 +155,12 @@ def get_model_config(
         # Fixed-trace study: route model traffic through the record/replay
         # transport. Returns None (and changes nothing) unless SWE_TRACE_MODE
         # (or ODR_TRACE_MODE) is set. See agent/common/trace_store.py.
-        trace_client = trace_store.get_http_client()
-        if trace_client is not None:
-            model_config["http_async_client"] = trace_client
+        trace_async_client = trace_store.get_http_client()
+        if trace_async_client is not None:
+            model_config["http_async_client"] = trace_async_client
+        trace_sync_client = trace_store.get_sync_http_client()
+        if trace_sync_client is not None:
+            model_config["http_client"] = trace_sync_client
     return model_config
 
 

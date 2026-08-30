@@ -843,6 +843,15 @@ async def main():
     results["kv_metrics_epoch"] = kv_metrics_reset.get("epoch") if kv_metrics_reset else None
     results["hbm_flushed"] = kv_metrics_reset.get("hbm_flushed") if kv_metrics_reset else None
     results["kv_metrics_reset_json"] = str(KV_METRICS_RESET_PATH) if kv_metrics_reset else None
+    results.update(trace_store.summary())
+    if trace_store.enabled() and results["trace_chat_completions_intercepted"] == 0:
+        print(
+            "\nWARNING: trace mode is "
+            f"{results['trace_mode']} but no chat completion reached the trace "
+            "transport. Either no model call was made (check "
+            f"{QUERY_SUMMARY_PATH} for setup_error / stream_error) or the model "
+            "traffic is not going through agent/common/model.py."
+        )
     print(
         "\nScore the patches on a machine with Docker:\n"
         f"  swebench eval -p {PREDICTIONS_PATH} -d {args.dataset} --run-id {RUN_ID}"

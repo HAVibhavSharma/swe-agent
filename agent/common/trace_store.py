@@ -104,6 +104,18 @@ class TraceConfig:
 _config: TraceConfig | None = None
 _config_lock = threading.Lock()
 
+# How many chat completions the transport has actually seen. A run that ends
+# with this at 0 while the mode says `record` did not route its model traffic
+# through here at all -- which is the failure that otherwise looks like "the
+# trace file was never created".
+_intercepted = 0
+_intercepted_lock = threading.Lock()
+
+
+def intercepted_count() -> int:
+    with _intercepted_lock:
+        return _intercepted
+
 
 def config() -> TraceConfig:
     """Resolve (once) and validate the trace configuration."""
@@ -116,11 +128,15 @@ def config() -> TraceConfig:
 
 def reset_config() -> None:
     """Forget the resolved config; for tests that flip the env var."""
-    global _config, _client
+    global _config, _client, _sync_client
     with _config_lock:
         _config = None
     with _client_lock:
         _client = None
+        _sync_client = None
+    global _intercepted
+    with _intercepted_lock:
+        _intercepted = 0
 
 
 def _resolve() -> TraceConfig:
@@ -253,11 +269,16 @@ class TraceStore:
         return None
 
 
-class TraceTransport(httpx.AsyncBaseTransport):
-    """httpx transport implementing the record / pinned / offline modes."""
+class _TraceTransportBase:
+    """Mode logic shared by the sync and async transports.
 
-    def __init__(self, inner: httpx.AsyncBaseTransport | None = None) -> None:
-        self._inner = inner or httpx.AsyncHTTPTransport()
+    Two transports are needed, not one: this repo's graph nodes are plain
+    ``def`` functions calling ``runnable.invoke(...)``, so LangGraph runs them
+    in a worker thread and ChatOpenAI uses its **sync** client. An async-only
+    transport sees none of that traffic and records an empty trace.
+    """
+
+    def __init__(self) -> None:
         cfg = config()
         self._mode = cfg.mode
         self._on_miss = cfg.on_miss
@@ -331,83 +352,85 @@ class TraceTransport(httpx.AsyncBaseTransport):
             return f"unparseable response body: {exc}"[:500]
         return None
 
-    # -- transport -------------------------------------------------------
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        # Only chat completions carry the workload; leave models/health alone.
-        if not request.url.path.endswith("/chat/completions"):
-            return await self._inner.handle_async_request(request)
-
-        raw = await request.aread()
+    # -- shared steps ----------------------------------------------------
+    def _parse(self, raw: bytes) -> dict[str, Any] | None:
         try:
-            body = json.loads(raw)
+            return json.loads(raw)
         except Exception:  # noqa: BLE001
-            return await self._inner.handle_async_request(request)
+            return None
 
-        key = request_key(body)
-        job_id = _job_id(body)
-        is_stream = bool(body.get("stream"))
-
-        if self._mode == "record":
-            started = time.perf_counter_ns()
-            response = await self._inner.handle_async_request(request)
-            text = (await response.aread()).decode("utf-8", errors="replace")
-            await response.aclose()
-            elapsed = time.perf_counter_ns() - started
-            self._append(
-                self._trace_path,
-                {
-                    "key": key,
-                    "job_id": job_id,
-                    "stream": is_stream,
-                    "status_code": response.status_code,
-                    "content_type": response.headers.get("content-type"),
-                    "request_body": body,
-                    "response_body": text,
-                    "record_latency_ns": elapsed,
-                },
-            )
-            return httpx.Response(
-                response.status_code,
-                headers={
-                    "content-type": response.headers.get(
-                        "content-type", "application/json"
-                    )
-                },
-                content=text.encode("utf-8"),
-                request=request,
+    def _note_interception(self, job_id: str) -> None:
+        global _intercepted
+        with _intercepted_lock:
+            _intercepted += 1
+            first = _intercepted == 1
+        if first:
+            # One line, on stdout, the first time traffic actually arrives: the
+            # difference between "recording" and "wired up but never called" is
+            # otherwise invisible until the run ends with an empty directory.
+            print(
+                f"[trace] {self._mode}: first chat completion intercepted "
+                f"(job={job_id}) -> {self._trace_path}",
+                flush=True,
             )
 
-        entry = self._store.take(job_id, key) if self._store else None
+    def _write_record(
+        self,
+        *,
+        key: str,
+        job_id: str,
+        body: dict[str, Any],
+        is_stream: bool,
+        status_code: int,
+        content_type: str | None,
+        text: str,
+        elapsed_ns: int,
+    ) -> None:
+        self._append(
+            self._trace_path,
+            {
+                "key": key,
+                "job_id": job_id,
+                "stream": is_stream,
+                "status_code": status_code,
+                "content_type": content_type,
+                "request_body": body,
+                "response_body": text,
+                "record_latency_ns": elapsed_ns,
+            },
+        )
 
-        if entry is None:
-            # The agent asked something the baseline never asked: the trajectory
-            # has diverged, and from here the two arms are no longer comparable.
-            self._append(
-                self._report_path,
-                {
-                    "key": key,
-                    "job_id": job_id,
-                    "reason": "miss",
-                    "mode": self._mode,
-                    "request_body": body,
-                },
+    def _miss(self, *, key: str, job_id: str, body: dict[str, Any]) -> None:
+        """Record the divergence, and stop the run when asked to."""
+        # The agent asked something the baseline never asked: the trajectory has
+        # diverged, and from here the two arms are no longer comparable.
+        self._append(
+            self._report_path,
+            {
+                "key": key,
+                "job_id": job_id,
+                "reason": "miss",
+                "mode": self._mode,
+                "request_body": body,
+            },
+        )
+        if self._on_miss == "strict":
+            raise RuntimeError(
+                f"Trace miss for job={job_id} key={key[:12]}; trajectory diverged "
+                "from the recorded baseline (SWE_TRACE_ON_MISS=strict)."
             )
-            if self._on_miss == "strict":
-                raise RuntimeError(
-                    f"Trace miss for job={job_id} key={key[:12]}; trajectory diverged "
-                    "from the recorded baseline (SWE_TRACE_ON_MISS=strict)."
-                )
-            logger.warning(
-                "Trace miss (job=%s key=%s); falling back to live call", job_id, key[:12]
-            )
-            return await self._inner.handle_async_request(request)
+        logger.warning(
+            "Trace miss (job=%s key=%s); falling back to live call", job_id, key[:12]
+        )
 
-        if self._mode == "offline":
-            return self._replayed_response(request, entry)
-
-        # pinned: issue the real call so the serving stack is exercised and
-        # timed, cap it at the baseline's output length, then discard what it
-        # produced in favour of the recording.
+    def _pinned_request(
+        self,
+        request: httpx.Request,
+        body: dict[str, Any],
+        entry: dict[str, Any],
+        is_stream: bool,
+    ) -> tuple[httpx.Request, int | None]:
+        """The live call to issue for timing: same request, baseline's length."""
         pinned_body = dict(body)
         completion_tokens = self._completion_tokens(
             entry["response_body"], entry.get("stream", is_stream)
@@ -427,43 +450,50 @@ class TraceTransport(httpx.AsyncBaseTransport):
             # aborts the request mid-stream -- after the 200 status line is
             # already on the wire. Capping is enough: max_tokens bounds the live
             # call above, so decode cost can only come in at or under baseline.
-        pinned_raw = json.dumps(pinned_body).encode("utf-8")
+        raw = json.dumps(pinned_body).encode("utf-8")
         headers = [
             (name, value)
             for name, value in request.headers.raw
             if name.lower() != b"content-length"
         ]
-        headers.append((b"content-length", str(len(pinned_raw)).encode()))
+        headers.append((b"content-length", str(len(raw)).encode()))
         live_request = httpx.Request(
-            request.method, request.url, headers=headers, content=pinned_raw
+            request.method, request.url, headers=headers, content=raw
         )
+        limit = pinned_body.get("max_completion_tokens", pinned_body.get("max_tokens"))
+        return live_request, limit
 
-        started = time.perf_counter_ns()
+    def _report_pinned(
+        self,
+        *,
+        key: str,
+        job_id: str,
+        entry: dict[str, Any],
+        is_stream: bool,
+        live_text: str | None,
+        live_status: int | None,
+        live_error: str | None,
+        elapsed_ns: int,
+        pinned_limit: int | None,
+    ) -> None:
         live_completion_tokens: int | None = None
-        live_error: str | None = None
-        try:
-            live_response = await self._inner.handle_async_request(live_request)
-            live_text = (await live_response.aread()).decode("utf-8", errors="replace")
-            await live_response.aclose()
-            live_status = live_response.status_code
+        if live_text is not None:
             # The status line is sent before generation starts, so a stream that
             # dies mid-flight still reports 200. Recover the real outcome from
             # the body instead of trusting the status code.
             live_completion_tokens = self._completion_tokens(live_text, is_stream)
-            live_error = self._response_error(live_text, is_stream)
+            live_error = live_error or self._response_error(live_text, is_stream)
             # A rejected request never decodes, so it costs almost nothing and
             # the recording still satisfies the agent -- the run looks healthy
             # and fast while the timing arm measured nothing. vLLM's flat error
             # shape ({"object": "error", ...}) has no "error" key, so the body
             # check above cannot catch it on its own.
-            if live_error is None and not 200 <= live_status < 300:
+            if (
+                live_error is None
+                and live_status is not None
+                and not 200 <= live_status < 300
+            ):
                 live_error = f"HTTP {live_status}: {live_text[:400]}"
-        except Exception as exc:  # noqa: BLE001
-            # A failed timing call must not change what the agent sees.
-            logger.warning("Pinned live call failed (%s); serving recording only", exc)
-            live_status = None
-            live_error = str(exc)
-        elapsed = time.perf_counter_ns() - started
 
         if live_error:
             logger.warning(
@@ -474,9 +504,6 @@ class TraceTransport(httpx.AsyncBaseTransport):
                 live_error,
             )
 
-        pinned_limit = pinned_body.get(
-            "max_completion_tokens", pinned_body.get("max_tokens")
-        )
         self._append(
             self._report_path,
             {
@@ -484,7 +511,7 @@ class TraceTransport(httpx.AsyncBaseTransport):
                 "job_id": job_id,
                 "reason": "pinned",
                 "live_status": live_status,
-                "live_latency_ns": elapsed,
+                "live_latency_ns": elapsed_ns,
                 "pinned_max_tokens": pinned_limit,
                 # Fidelity of the timing call: equal to pinned_max_tokens means
                 # the live run decoded exactly as many tokens as the baseline.
@@ -495,7 +522,177 @@ class TraceTransport(httpx.AsyncBaseTransport):
                 "baseline_latency_ns": entry.get("record_latency_ns"),
             },
         )
+
+
+class AsyncTraceTransport(_TraceTransportBase, httpx.AsyncBaseTransport):
+    """The async half: used by ChatOpenAI's ``ainvoke`` / ``astream`` path."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport | None = None) -> None:
+        super().__init__()
+        self._inner = inner or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        # Only chat completions carry the workload; leave models/health alone.
+        if not request.url.path.endswith("/chat/completions"):
+            return await self._inner.handle_async_request(request)
+
+        body = self._parse(await request.aread())
+        if body is None:
+            return await self._inner.handle_async_request(request)
+
+        key = request_key(body)
+        job_id = _job_id(body)
+        is_stream = bool(body.get("stream"))
+        self._note_interception(job_id)
+
+        if self._mode == "record":
+            started = time.perf_counter_ns()
+            response = await self._inner.handle_async_request(request)
+            text = (await response.aread()).decode("utf-8", errors="replace")
+            await response.aclose()
+            elapsed = time.perf_counter_ns() - started
+            content_type = response.headers.get("content-type")
+            self._write_record(
+                key=key,
+                job_id=job_id,
+                body=body,
+                is_stream=is_stream,
+                status_code=response.status_code,
+                content_type=content_type,
+                text=text,
+                elapsed_ns=elapsed,
+            )
+            return httpx.Response(
+                response.status_code,
+                headers={"content-type": content_type or "application/json"},
+                content=text.encode("utf-8"),
+                request=request,
+            )
+
+        entry = self._store.take(job_id, key) if self._store else None
+        if entry is None:
+            self._miss(key=key, job_id=job_id, body=body)
+            return await self._inner.handle_async_request(request)
+
+        if self._mode == "offline":
+            return self._replayed_response(request, entry)
+
+        # pinned: issue the real call so the serving stack is exercised and
+        # timed, cap it at the baseline's output length, then discard what it
+        # produced in favour of the recording.
+        live_request, pinned_limit = self._pinned_request(request, body, entry, is_stream)
+        started = time.perf_counter_ns()
+        live_text: str | None = None
+        live_status: int | None = None
+        live_error: str | None = None
+        try:
+            live_response = await self._inner.handle_async_request(live_request)
+            live_text = (await live_response.aread()).decode("utf-8", errors="replace")
+            await live_response.aclose()
+            live_status = live_response.status_code
+        except Exception as exc:  # noqa: BLE001
+            # A failed timing call must not change what the agent sees.
+            logger.warning("Pinned live call failed (%s); serving recording only", exc)
+            live_error = str(exc)
+        elapsed = time.perf_counter_ns() - started
+
+        self._report_pinned(
+            key=key,
+            job_id=job_id,
+            entry=entry,
+            is_stream=is_stream,
+            live_text=live_text,
+            live_status=live_status,
+            live_error=live_error,
+            elapsed_ns=elapsed,
+            pinned_limit=pinned_limit,
+        )
         return self._replayed_response(request, entry)
+
+
+class SyncTraceTransport(_TraceTransportBase, httpx.BaseTransport):
+    """The sync half: what this repo's ``runnable.invoke(...)`` nodes actually use."""
+
+    def __init__(self, inner: httpx.BaseTransport | None = None) -> None:
+        super().__init__()
+        self._inner = inner or httpx.HTTPTransport()
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/chat/completions"):
+            return self._inner.handle_request(request)
+
+        body = self._parse(request.read())
+        if body is None:
+            return self._inner.handle_request(request)
+
+        key = request_key(body)
+        job_id = _job_id(body)
+        is_stream = bool(body.get("stream"))
+        self._note_interception(job_id)
+
+        if self._mode == "record":
+            started = time.perf_counter_ns()
+            response = self._inner.handle_request(request)
+            text = response.read().decode("utf-8", errors="replace")
+            response.close()
+            elapsed = time.perf_counter_ns() - started
+            content_type = response.headers.get("content-type")
+            self._write_record(
+                key=key,
+                job_id=job_id,
+                body=body,
+                is_stream=is_stream,
+                status_code=response.status_code,
+                content_type=content_type,
+                text=text,
+                elapsed_ns=elapsed,
+            )
+            return httpx.Response(
+                response.status_code,
+                headers={"content-type": content_type or "application/json"},
+                content=text.encode("utf-8"),
+                request=request,
+            )
+
+        entry = self._store.take(job_id, key) if self._store else None
+        if entry is None:
+            self._miss(key=key, job_id=job_id, body=body)
+            return self._inner.handle_request(request)
+
+        if self._mode == "offline":
+            return self._replayed_response(request, entry)
+
+        live_request, pinned_limit = self._pinned_request(request, body, entry, is_stream)
+        started = time.perf_counter_ns()
+        live_text: str | None = None
+        live_status: int | None = None
+        live_error: str | None = None
+        try:
+            live_response = self._inner.handle_request(live_request)
+            live_text = live_response.read().decode("utf-8", errors="replace")
+            live_response.close()
+            live_status = live_response.status_code
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pinned live call failed (%s); serving recording only", exc)
+            live_error = str(exc)
+        elapsed = time.perf_counter_ns() - started
+
+        self._report_pinned(
+            key=key,
+            job_id=job_id,
+            entry=entry,
+            is_stream=is_stream,
+            live_text=live_text,
+            live_status=live_status,
+            live_error=live_error,
+            elapsed_ns=elapsed,
+            pinned_limit=pinned_limit,
+        )
+        return self._replayed_response(request, entry)
+
+
+# The async transport under its original name.
+TraceTransport = AsyncTraceTransport
 
 
 _client: httpx.AsyncClient | None = None
@@ -513,6 +710,7 @@ def get_http_client() -> httpx.AsyncClient | None:
                 transport=TraceTransport(),
                 timeout=httpx.Timeout(600.0, connect=30.0),
             )
+            print(f"[trace] transport attached ({describe()})", flush=True)
         return _client
 
 
@@ -525,3 +723,19 @@ def describe() -> str:
         f"Trace mode: {cfg.mode} (path={cfg.path}, on_miss={cfg.on_miss}, "
         f"report={cfg.report_path})"
     )
+
+
+def summary() -> dict[str, Any]:
+    """What the harness prints at the end of a run."""
+    cfg = config()
+    written = 0
+    path = Path(cfg.path) if cfg.path else None
+    if cfg.mode == "record" and path and path.exists():
+        with path.open("r", encoding="utf-8") as handle:
+            written = sum(1 for line in handle if line.strip())
+    return {
+        "trace_mode": cfg.mode,
+        "trace_path": cfg.path or None,
+        "trace_chat_completions_intercepted": intercepted_count(),
+        "trace_records_written": written,
+    }
