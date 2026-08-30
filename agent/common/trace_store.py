@@ -17,14 +17,19 @@ This module pins the trajectory. A baseline run in ``record`` mode dumps every
 chat-completion request/response pair to a JSONL trace. Both arms then run in
 ``pinned`` mode: the request still goes to the real server (so prefill, decode
 and prefetch are genuinely exercised and timed), but the sampled output is
-discarded and the *recorded* response is handed back to the agent.
+discarded and the *recorded* response is handed back to the agent. The live call
+is not truncated -- it decodes as much as it wants -- so the trajectory stays
+pinned while the timing reflects the work this stack actually does.
 
 Modes (``SWE_TRACE_MODE``, or ``ODR_TRACE_MODE``)
 -------------------------------------------------
 ``off``      Default. No interception.
 ``record``   Live calls, every request/response appended to the trace.
-``pinned``   Live call issued for timing (output capped at the recorded length),
-             recorded response returned.
+``pinned``   Live call issued for timing and allowed to run to its own
+             stopping point; the recorded response is returned to the agent.
+             ``SWE_TRACE_PIN_LENGTH=1`` caps it at the recorded completion
+             length instead, bounding decode cost above at the price of
+             truncating a response that wanted to be longer.
 ``offline``  No server contact; recorded response returned immediately. Cheap
              way to check that a code change keeps the trajectory intact.
 
@@ -33,6 +38,8 @@ Environment (``SWE_`` prefix preferred, ``ODR_`` accepted for parity with ODR)
 ``SWE_TRACE_MODE``     one of the modes above
 ``SWE_TRACE_PATH``     trace JSONL (read in pinned/offline, written in record)
 ``SWE_TRACE_ON_MISS``  ``strict`` (raise) or ``live`` (fall back, default)
+``SWE_TRACE_PIN_LENGTH``  ``1`` caps the pinned live call at the recorded
+                       completion length (default off, uncapped)
 ``SWE_TRACE_REPORT``   divergence report JSONL; defaults next to the trace
 
 Interception is at the HTTP layer, not the LangChain call sites, because the
@@ -111,6 +118,10 @@ class TraceConfig:
     # baseline's token count, `full_length_dir` for every other pinned request.
     early_exit_dir: Path | None
     full_length_dir: Path | None
+    # Cap the live call at the recorded completion length. Off by default: the
+    # live call runs to its own stopping point, so a response that wants more
+    # tokens than the baseline is allowed to produce them.
+    pin_length: bool
 
 
 _config: TraceConfig | None = None
@@ -159,7 +170,7 @@ def _resolve() -> TraceConfig:
     path = _env("TRACE_PATH")
     on_miss = (_env("TRACE_ON_MISS", "live") or "live").lower()
     if mode == "off":
-        return TraceConfig(mode, path, on_miss, None, None, None)
+        return TraceConfig(mode, path, on_miss, None, None, None, False)
 
     if not path:
         raise ValueError(f"TRACE_MODE={mode} requires SWE_TRACE_PATH to be set")
@@ -201,8 +212,15 @@ def _resolve() -> TraceConfig:
     full_length_dir = (
         Path(full_length) if full_length else Path.cwd() / FULL_LENGTH_DIRNAME
     )
+    pin_length = _env("TRACE_PIN_LENGTH", "0").lower() in {"1", "true", "yes", "on"}
     return TraceConfig(
-        mode, path, on_miss, report_path, early_exit_dir, full_length_dir
+        mode,
+        path,
+        on_miss,
+        report_path,
+        early_exit_dir,
+        full_length_dir,
+        pin_length,
     )
 
 
@@ -312,6 +330,7 @@ class _TraceTransportBase:
         )
         self._early_exit_dir = cfg.early_exit_dir or Path.cwd() / EARLY_EXIT_DIRNAME
         self._full_length_dir = cfg.full_length_dir or Path.cwd() / FULL_LENGTH_DIRNAME
+        self._pin_length = cfg.pin_length
         self._store = TraceStore(cfg.path) if self._mode in {"pinned", "offline"} else None
         self._write_lock = threading.Lock()
 
@@ -417,6 +436,7 @@ class _TraceTransportBase:
         live_text: str,
         live_status: int | None,
         live_completion_tokens: int | None,
+        baseline_tokens: int | None,
         pinned_limit: int | None,
         elapsed_ns: int,
     ) -> Path:
@@ -453,6 +473,7 @@ class _TraceTransportBase:
                         "stream": is_stream,
                         "reason": reason,
                         "pinned_max_tokens": pinned_limit,
+                        "baseline_completion_tokens": baseline_tokens,
                         "live_completion_tokens": live_completion_tokens,
                         "live_status": live_status,
                         "live_latency_ns": elapsed_ns,
@@ -554,12 +575,39 @@ class _TraceTransportBase:
         body: dict[str, Any],
         entry: dict[str, Any],
         is_stream: bool,
-    ) -> tuple[httpx.Request, int | None]:
-        """The live call to issue for timing: same request, baseline's length."""
-        pinned_body = dict(body)
-        completion_tokens = self._completion_tokens(
+    ) -> tuple[httpx.Request, int | None, int | None]:
+        """The live call to issue for timing.
+
+        Returns ``(request, cap, baseline_completion_tokens)``. By default there
+        is no cap: the live call decodes until it stops on its own, so a
+        response that needs more tokens than the recording used is not truncated
+        mid-stream. That makes the timing arm an honest measurement of what this
+        stack does with this prompt, at the price of a decode that can run
+        longer than the baseline's -- ``baseline_completion_tokens`` is reported
+        alongside the live count so the gap is visible either way.
+
+        ``SWE_TRACE_PIN_LENGTH=1`` restores the cap for a run that would rather
+        bound decode cost above than see the whole output.
+        """
+        baseline_tokens = self._completion_tokens(
             entry["response_body"], entry.get("stream", is_stream)
         )
+        if not self._pin_length:
+            # Send the request exactly as the agent wrote it.
+            raw = json.dumps(body).encode("utf-8")
+            headers = [
+                (name, value)
+                for name, value in request.headers.raw
+                if name.lower() != b"content-length"
+            ]
+            headers.append((b"content-length", str(len(raw)).encode()))
+            live_request = httpx.Request(
+                request.method, request.url, headers=headers, content=raw
+            )
+            return live_request, None, baseline_tokens
+
+        pinned_body = dict(body)
+        completion_tokens = baseline_tokens
         if completion_tokens:
             # Pin whichever length field the client actually sent: vLLM honours
             # max_completion_tokens over the deprecated max_tokens, so setting
@@ -573,8 +621,7 @@ class _TraceTransportBase:
             # accepts only EOS once the JSON is closed. Suppressing EOS makes the
             # sampler emit the next-best token, the scheduler rejects it and
             # aborts the request mid-stream -- after the 200 status line is
-            # already on the wire. Capping is enough: max_tokens bounds the live
-            # call above, so decode cost can only come in at or under baseline.
+            # already on the wire.
         raw = json.dumps(pinned_body).encode("utf-8")
         headers = [
             (name, value)
@@ -586,7 +633,7 @@ class _TraceTransportBase:
             request.method, request.url, headers=headers, content=raw
         )
         limit = pinned_body.get("max_completion_tokens", pinned_body.get("max_tokens"))
-        return live_request, limit
+        return live_request, limit, baseline_tokens
 
     def _report_pinned(
         self,
@@ -601,6 +648,7 @@ class _TraceTransportBase:
         live_error: str | None,
         elapsed_ns: int,
         pinned_limit: int | None,
+        baseline_tokens: int | None,
     ) -> None:
         live_completion_tokens: int | None = None
         if live_text is not None:
@@ -622,29 +670,29 @@ class _TraceTransportBase:
                 live_error = f"HTTP {live_status}: {live_text[:400]}"
 
         # Every pinned request gets its two outputs written side by side, split
-        # across two folders. "early_exit" is the live call that hit EOS before
-        # the cap, so it decoded fewer tokens than the baseline -- the case
-        # where the discarded output is known to differ. The rest go elsewhere
-        # so that set stays small and readable.
+        # across two folders. The comparison is against the *baseline's* length,
+        # not a cap: uncapped, a live call is free to stop earlier or run longer
+        # than the recording, and "stopped earlier" is the case where the
+        # discarded output is known to be a different answer.
         dump_path: Path | None = None
         dump_reason: str | None = None
         if live_text is not None:
-            if (
-                live_completion_tokens is not None
-                and pinned_limit is not None
-                and live_completion_tokens < pinned_limit
-            ):
+            if live_completion_tokens is None:
+                # No usage in the response to say how long it was -- an aborted
+                # stream, usually.
+                dump_reason = "unknown_length"
+                directory = self._full_length_dir
+            elif baseline_tokens is None:
+                dump_reason = "no_baseline_length"
+                directory = self._full_length_dir
+            elif live_completion_tokens < baseline_tokens:
                 dump_reason = "early_exit"
                 directory = self._early_exit_dir
+            elif live_completion_tokens == baseline_tokens:
+                dump_reason = "same_length"
+                directory = self._full_length_dir
             else:
-                # Either it decoded exactly the cap, or the response carried no
-                # usage to say so (an aborted stream, usually). Both are "not
-                # early"; the reason keeps them apart inside the file.
-                dump_reason = (
-                    "full_length"
-                    if live_completion_tokens is not None
-                    else "unknown_length"
-                )
+                dump_reason = "longer"
                 directory = self._full_length_dir
             try:
                 dump_path = self._dump_pinned_pair(
@@ -658,6 +706,7 @@ class _TraceTransportBase:
                     live_text=live_text,
                     live_status=live_status,
                     live_completion_tokens=live_completion_tokens,
+                    baseline_tokens=baseline_tokens,
                     pinned_limit=pinned_limit,
                     elapsed_ns=elapsed_ns,
                 )
@@ -681,11 +730,16 @@ class _TraceTransportBase:
                 "reason": "pinned",
                 "live_status": live_status,
                 "live_latency_ns": elapsed_ns,
+                # None unless SWE_TRACE_PIN_LENGTH=1: by default the live
+                # call is not capped.
                 "pinned_max_tokens": pinned_limit,
-                # Fidelity of the timing call: equal to pinned_max_tokens means
-                # the live run decoded exactly as many tokens as the baseline.
-                # Fewer means it hit EOS early; null usually means the stream was
-                # aborted before it carried usage.
+                # Fidelity of the timing call, against the recording rather than
+                # against a cap: equal counts mean the live run decoded exactly
+                # as much as the baseline, fewer means it stopped earlier, more
+                # means this stack wanted a longer answer for the same prompt.
+                # Null usually means the stream was aborted before it carried
+                # usage.
+                "baseline_completion_tokens": baseline_tokens,
                 "live_completion_tokens": live_completion_tokens,
                 "live_error": live_error,
                 "baseline_latency_ns": entry.get("record_latency_ns"),
@@ -753,7 +807,9 @@ class AsyncTraceTransport(_TraceTransportBase, httpx.AsyncBaseTransport):
         # pinned: issue the real call so the serving stack is exercised and
         # timed, cap it at the baseline's output length, then discard what it
         # produced in favour of the recording.
-        live_request, pinned_limit = self._pinned_request(request, body, entry, is_stream)
+        live_request, pinned_limit, baseline_tokens = self._pinned_request(
+            request, body, entry, is_stream
+        )
         started = time.perf_counter_ns()
         live_text: str | None = None
         live_status: int | None = None
@@ -780,6 +836,7 @@ class AsyncTraceTransport(_TraceTransportBase, httpx.AsyncBaseTransport):
             live_error=live_error,
             elapsed_ns=elapsed,
             pinned_limit=pinned_limit,
+            baseline_tokens=baseline_tokens,
         )
         return self._replayed_response(request, entry)
 
@@ -836,7 +893,9 @@ class SyncTraceTransport(_TraceTransportBase, httpx.BaseTransport):
         if self._mode == "offline":
             return self._replayed_response(request, entry)
 
-        live_request, pinned_limit = self._pinned_request(request, body, entry, is_stream)
+        live_request, pinned_limit, baseline_tokens = self._pinned_request(
+            request, body, entry, is_stream
+        )
         started = time.perf_counter_ns()
         live_text: str | None = None
         live_status: int | None = None
@@ -862,6 +921,7 @@ class SyncTraceTransport(_TraceTransportBase, httpx.BaseTransport):
             live_error=live_error,
             elapsed_ns=elapsed,
             pinned_limit=pinned_limit,
+            baseline_tokens=baseline_tokens,
         )
         return self._replayed_response(request, entry)
 
