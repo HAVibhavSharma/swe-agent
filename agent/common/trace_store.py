@@ -37,7 +37,8 @@ Environment (``SWE_`` prefix preferred, ``ODR_`` accepted for parity with ODR)
 -----------------------------------------------------------------------------
 ``SWE_TRACE_MODE``     one of the modes above
 ``SWE_TRACE_PATH``     trace JSONL (read in pinned/offline, written in record)
-``SWE_TRACE_ON_MISS``  ``strict`` (raise) or ``live`` (fall back, default)
+``SWE_TRACE_ON_MISS``  ``strict`` (fail the call with a non-retryable 400) or
+                       ``live`` (fall back to a real call, default)
 ``SWE_TRACE_PIN_LENGTH``  ``1`` caps the pinned live call at the recorded
                        completion length (default off, uncapped)
 ``SWE_TRACE_REPORT``   divergence report JSONL; defaults next to the trace
@@ -547,7 +548,7 @@ class _TraceTransportBase:
         )
 
     def _miss(self, *, key: str, job_id: str, body: dict[str, Any]) -> None:
-        """Record the divergence, and stop the run when asked to."""
+        """Record the divergence. The caller decides what to serve."""
         # The agent asked something the baseline never asked: the trajectory has
         # diverged, and from here the two arms are no longer comparable.
         self._append(
@@ -561,12 +562,56 @@ class _TraceTransportBase:
             },
         )
         if self._on_miss == "strict":
-            raise RuntimeError(
-                f"Trace miss for job={job_id} key={key[:12]}; trajectory diverged "
-                "from the recorded baseline (SWE_TRACE_ON_MISS=strict)."
+            logger.warning(
+                "Trace miss (job=%s key=%s node=%s); failing the call "
+                "(SWE_TRACE_ON_MISS=strict)",
+                job_id,
+                key[:12],
+                body.get("langgraph_node"),
             )
+            return
         logger.warning(
             "Trace miss (job=%s key=%s); falling back to live call", job_id, key[:12]
+        )
+
+    def _strict_miss_response(
+        self,
+        request: httpx.Request,
+        *,
+        key: str,
+        job_id: str,
+        body: dict[str, Any],
+    ) -> httpx.Response:
+        """A 400 the client will surface as-is, rather than a raised exception.
+
+        An exception raised inside the transport reaches the OpenAI client as a
+        generic ``APIConnectionError``, which it then *retries* -- so a strict
+        miss used to burn the client's retry budget and get reported as a
+        network failure, hiding the one fact that matters. A 400 is not
+        retryable, so the call fails once, immediately, carrying the reason.
+        """
+        message = (
+            f"trace miss: job={job_id} key={key[:12]} "
+            f"node={body.get('langgraph_node')}; this request is not in "
+            f"{self._trace_path} (SWE_TRACE_ON_MISS=strict). The trajectory "
+            f"diverged from the recording -- see {self._report_path}."
+        )
+        payload = {
+            "error": {
+                "message": message,
+                # Deliberately not one of OpenAI's own types: this did not come
+                # from the model server, and a reader should not go looking for
+                # it there.
+                "type": "trace_miss",
+                "code": "trace_miss",
+                "param": None,
+            }
+        }
+        return httpx.Response(
+            400,
+            headers={"content-type": "application/json"},
+            content=json.dumps(payload).encode("utf-8"),
+            request=request,
         )
 
     def _pinned_request(
@@ -799,6 +844,10 @@ class AsyncTraceTransport(_TraceTransportBase, httpx.AsyncBaseTransport):
         entry = self._store.take(job_id, key) if self._store else None
         if entry is None:
             self._miss(key=key, job_id=job_id, body=body)
+            if self._on_miss == "strict":
+                return self._strict_miss_response(
+                    request, key=key, job_id=job_id, body=body
+                )
             return await self._inner.handle_async_request(request)
 
         if self._mode == "offline":
@@ -888,6 +937,10 @@ class SyncTraceTransport(_TraceTransportBase, httpx.BaseTransport):
         entry = self._store.take(job_id, key) if self._store else None
         if entry is None:
             self._miss(key=key, job_id=job_id, body=body)
+            if self._on_miss == "strict":
+                return self._strict_miss_response(
+                    request, key=key, job_id=job_id, body=body
+                )
             return self._inner.handle_request(request)
 
         if self._mode == "offline":
