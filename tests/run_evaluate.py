@@ -34,6 +34,7 @@ from agent.common.model import MODEL_NAME, MODEL_PROVIDER
 
 try:
     # `python tests/run_evaluate.py` puts tests/ on sys.path...
+    from batch_control import parse_only_questions, run_batch
     from kv_metrics_reset import reset_kv_metrics
     from swebench_instances import (
         append_prediction,
@@ -45,6 +46,7 @@ try:
         problem_statement_message,
     )
 except ImportError:  # ...`python -m tests.run_evaluate` does not.
+    from tests.batch_control import parse_only_questions, run_batch
     from tests.kv_metrics_reset import reset_kv_metrics
     from tests.swebench_instances import (
         append_prediction,
@@ -287,6 +289,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not POST /v1/kv_metrics/reset between the phases.",
     )
+    # Batch control, spelled as open_deep_research's harness spells it because
+    # pitlane drives both with the same flags and sniffs this file for them.
+    # Implemented in tests/batch_control.py.
+    parser.add_argument(
+        "--completed-log",
+        type=Path,
+        default=None,
+        help=(
+            "File recording which instances of this batch have finished. On "
+            "start those are skipped; each one is appended as it completes, so "
+            "a batch interrupted at instance 40 resumes at 41. The sample is "
+            "drawn exactly as for an uninterrupted run, so indices still match."
+        ),
+    )
+    parser.add_argument(
+        "--only-questions",
+        default=None,
+        help=(
+            "Comma-separated 1-based indices into the --max-instances sample, "
+            "e.g. '17,35,46': run only those. Each keeps the job id it has in "
+            "the full run, which is what pinned replay looks it up by. Needs "
+            "--completions-per-instance 1."
+        ),
+    )
+    parser.add_argument(
+        "--hbm-flush-between-queries",
+        action="store_true",
+        help=(
+            "Flush GPU HBM after every instance, not only before the first. "
+            "Without it every instance after the first starts on the HBM the "
+            "one before it left resident -- measuring a cache it did not build."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -462,12 +497,13 @@ async def target(
     logical_job_index: int,
     instance_index: int,
     phase: str = PHASE_WARM,
+    fixed_job_id: str | None = None,
 ):
     graph = swe_agent_builder.compile(
         checkpointer=MemorySaver(),
         _is_root=True,
     )
-    job_id = str(next(job_counter))
+    job_id = fixed_job_id or str(next(job_counter))
     thread_id = str(uuid.uuid4())
     started_at_utc = datetime.now(timezone.utc).isoformat()
     started_at_ns = time.perf_counter_ns()
@@ -685,10 +721,18 @@ async def _run_cold_phase_isolated(
             os.environ["LANGGRAPH_PREDICTION_LOG_DIR"] = previous
 
 
+def _continue_job_ids(first: int) -> None:
+    global job_counter
+    job_counter = itertools.count(first)
+
+
 async def _run_warm_phase(
     selected: list[dict[str, Any]],
     *,
     completions_per_instance: int,
+    completed_log: Path | None = None,
+    only_questions: set[int] | None = None,
+    flush_between: bool = False,
 ) -> dict[str, Any]:
     """The measured pass: every instance, `completions_per_instance` times.
 
@@ -696,26 +740,29 @@ async def _run_warm_phase(
     one `./workspace_repo`, because the agent hard-codes that path. Two jobs at
     once would edit each other's checkout. Concurrency here needs per-job
     workspaces first -- see plan/02-required-changes.md.
+
+    Resume (`--completed-log`), subsets, per-instance HBM flushes and
+    interrupts at an instance boundary come from tests/batch_control.py.
     """
-    completion_rows: list[dict[str, Any]] = []
-    total = completions_per_instance * len(selected)
-    position = 0
-    for instance_index in range(1, completions_per_instance + 1):
-        for job_index, instance in enumerate(selected, start=1):
-            position += 1
-            print(f"[warm {position}/{total}] {instance['instance_id']} run {instance_index}")
-            result = await target(
-                instance,
-                logical_job_index=job_index,
-                instance_index=instance_index,
-                phase=PHASE_WARM,
-            )
-            completion_rows.append(result)
-            _append_csv_row(_phase_e2e_csv_path(PHASE_WARM), _e2e_csv_row(result))
+    batch = await run_batch(
+        selected,
+        completions_per_instance=completions_per_instance,
+        run_one=lambda instance, **kwargs: target(instance, phase=PHASE_WARM, **kwargs),
+        on_row=lambda row: _append_csv_row(_phase_e2e_csv_path(PHASE_WARM), _e2e_csv_row(row)),
+        completed_log=completed_log,
+        only_questions=only_questions,
+        flush_between=flush_between,
+        set_next_job_id=_continue_job_ids,
+    )
+    completion_rows = batch["rows"]
 
     failed = [row for row in completion_rows if not row["success"]]
     empty = [row for row in completion_rows if row["empty_patch"]]
     return {
+        "drained": batch["drained"],
+        "between_query_flushes": batch["between_query_flushes"],
+        "between_query_flushes_ok": batch["between_query_flushes_ok"],
+        "skipped_already_done": batch["skipped_already_done"],
         "run_id": RUN_ID,
         "sampled_instances": len(selected),
         "completions_per_instance": completions_per_instance,
@@ -834,6 +881,13 @@ async def main():
     results = await _run_warm_phase(
         selected,
         completions_per_instance=args.completions_per_instance,
+        completed_log=args.completed_log,
+        only_questions=parse_only_questions(
+            args.only_questions, len(selected), args.completions_per_instance
+        ),
+        # Gated on the same switch as the phase-boundary reset: the flush is a
+        # parameter of that endpoint, so an arm that cannot reset cannot flush.
+        flush_between=args.hbm_flush_between_queries and not args.no_kv_metrics_reset,
     )
     results["cold_runs"] = len(cold_rows)
     results["cold_runs_failed"] = sum(1 for row in cold_rows if not row["success"])

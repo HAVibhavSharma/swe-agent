@@ -35,6 +35,7 @@ from agent.common.model import MODEL_NAME, MODEL_PROVIDER
 
 try:
     # `python tests/run_evaluate_node_eviction.py` puts tests/ on sys.path...
+    from batch_control import parse_only_questions, run_batch
     from kv_metrics_reset import reset_kv_metrics
     from system_prompt_population import populate_system_prompts
     from swebench_instances import (
@@ -47,6 +48,7 @@ try:
         problem_statement_message,
     )
 except ImportError:  # ...`python -m tests.run_evaluate_node_eviction` does not.
+    from tests.batch_control import parse_only_questions, run_batch
     from tests.kv_metrics_reset import reset_kv_metrics
     from tests.system_prompt_population import populate_system_prompts
     from tests.swebench_instances import (
@@ -352,6 +354,39 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(prefill_on_miss=True)
     parser.add_argument("--no-hbm-flush", action="store_true")
     parser.add_argument("--no-kv-metrics-reset", action="store_true")
+    # Batch control, spelled as open_deep_research's harness spells it because
+    # pitlane drives both with the same flags and sniffs this file for them.
+    # Implemented in tests/batch_control.py.
+    parser.add_argument(
+        "--completed-log",
+        type=Path,
+        default=None,
+        help=(
+            "File recording which instances of this batch have finished. On "
+            "start those are skipped; each one is appended as it completes, so "
+            "a batch interrupted at instance 40 resumes at 41. The sample is "
+            "drawn exactly as for an uninterrupted run, so indices still match."
+        ),
+    )
+    parser.add_argument(
+        "--only-questions",
+        default=None,
+        help=(
+            "Comma-separated 1-based indices into the --max-instances sample, "
+            "e.g. '17,35,46': run only those. Each keeps the job id it has in "
+            "the full run, which is what pinned replay looks it up by. Needs "
+            "--completions-per-instance 1."
+        ),
+    )
+    parser.add_argument(
+        "--hbm-flush-between-queries",
+        action="store_true",
+        help=(
+            "Flush GPU HBM after every instance, not only before the first. "
+            "Without it every instance after the first starts on the HBM the "
+            "one before it left resident -- measuring a cache it did not build."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -460,9 +495,10 @@ async def target(
     logical_job_index: int,
     instance_index: int,
     phase: str = PHASE_WARM,
+    fixed_job_id: str | None = None,
 ):
     graph = swe_agent_builder.compile(checkpointer=MemorySaver(), _is_root=True)
-    job_id = str(next(job_counter))
+    job_id = fixed_job_id or str(next(job_counter))
     thread_id = str(uuid.uuid4())
     started_at_utc = datetime.now(timezone.utc).isoformat()
     started_at_ns = time.perf_counter_ns()
@@ -684,6 +720,11 @@ async def _run_phase(
     return rows
 
 
+def _continue_job_ids(first: int) -> None:
+    global job_counter
+    job_counter = itertools.count(first)
+
+
 async def _run_cold_phase_isolated(
     selected: list[dict[str, Any]],
     runs_per_instance: int,
@@ -789,10 +830,30 @@ async def main():
 
         # ---- warm phase ---------------------------------------------------
         print(f"Warm phase: measuring, report goes to {METRICS_DIR}")
-        warm_rows = await _run_phase(selected, args.completions_per_instance, PHASE_WARM)
+        # Resume, subsets, per-instance HBM flushes and interrupts at an
+        # instance boundary: tests/batch_control.py.
+        batch = await run_batch(
+            selected,
+            completions_per_instance=args.completions_per_instance,
+            run_one=lambda instance, **kwargs: target(instance, phase=PHASE_WARM, **kwargs),
+            on_row=lambda row: _append_csv_row(_phase_e2e_csv_path(PHASE_WARM), _e2e_csv_row(row)),
+            completed_log=args.completed_log,
+            only_questions=parse_only_questions(
+                args.only_questions, len(selected), args.completions_per_instance
+            ),
+            # The flush is a parameter of the reset endpoint, so an arm that
+            # cannot reset cannot flush either.
+            flush_between=args.hbm_flush_between_queries and not args.no_kv_metrics_reset,
+            set_next_job_id=_continue_job_ids,
+        )
+        warm_rows = batch["rows"]
 
         results = {
             "run_id": RUN_ID,
+            "drained": batch["drained"],
+            "between_query_flushes": batch["between_query_flushes"],
+            "between_query_flushes_ok": batch["between_query_flushes_ok"],
+            "skipped_already_done": batch["skipped_already_done"],
             "sampled_instances": len(selected),
             "completions_per_instance": args.completions_per_instance,
             "completed_runs": len(warm_rows),
