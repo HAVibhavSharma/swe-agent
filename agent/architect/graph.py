@@ -21,6 +21,7 @@ from agent.common.model import (
 )
 from agent.tools.search import search_tools
 from agent.tools.codemap import codemap_tools
+from agent.tools.errors import tool_error_message
 from agent.tools.write import get_files_structure
 from helpers.prompts import markdown_to_prompt_template
 from agent.common.entities import ImplementationPlan
@@ -47,7 +48,11 @@ extract_implementation_prompt = markdown_to_prompt_template("agent/architect/pro
 
 research_tools = search_tools + codemap_tools
 
-tool_node = ToolNode(codemap_tools+search_tools, messages_key="implementation_research_scratchpad")
+# A tool that raises -- a path the model guessed wrong is the usual one -- comes
+# back to it as an error message to recover from. ToolNode's default re-raises
+# anything but a bad-arguments error, so one FileNotFoundError ended the whole
+# instance.
+tool_node = ToolNode(codemap_tools+search_tools, messages_key="implementation_research_scratchpad", handle_tool_errors=tool_error_message)
 
 class ComeUpWithResearchNextStepOutput(TypedDict):
     research_next_step: str

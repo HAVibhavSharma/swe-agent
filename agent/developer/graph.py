@@ -22,6 +22,7 @@ from agent.developer.state import SoftwareDeveloperState, Diffs
 from langgraph.prebuilt import ToolNode
 from agent.tools.search import search_tools
 from agent.tools.codemap import codemap_tools
+from agent.tools.errors import tool_error_message
 from agent.tools.write import get_files_structure
 # Load the extract diff prompt
 extract_diffs_tasks_prompt = markdown_to_prompt_template("agent/developer/prompts/create_diff_prompt.md")
@@ -302,7 +303,9 @@ def creating_diffs_for_task(state: SoftwareDeveloperState, config: RunnableConfi
                     f.flush()
 
 # Create tool node
-research_tool_node = ToolNode(search_tools + codemap_tools, messages_key="atomic_implementation_research")
+# Errors go back to the model rather than ending the instance; see the
+# architect's tool_node.
+research_tool_node = ToolNode(search_tools + codemap_tools, messages_key="atomic_implementation_research", handle_tool_errors=tool_error_message)
 
 # Create the workflow graph
 workflow = StateGraph(SoftwareDeveloperState)
