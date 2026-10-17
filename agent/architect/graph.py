@@ -11,6 +11,7 @@ from langgraph.graph import StateGraph
 
 from agent.architect.state import SoftwareArchitectState
 from agent.common.configuration import Configuration
+from agent.common import prompt_seeds
 from agent.common.model import (
     EXTRACT_PLAN_MAX_TOKENS,
     PLAN_MAX_TOKENS,
@@ -52,8 +53,71 @@ class ComeUpWithResearchNextStepOutput(TypedDict):
     research_next_step: str
     implementation_research_scratchpad: List[AnyMessage]
 
+def _codebase_structure() -> str:
+    return get_files_structure.invoke({"directory": "./workspace_repo"})
+
+
+def _seed_after_planning(state: SoftwareArchitectState, config: RunnableConfig, new_messages: List[AnyMessage]) -> None:
+    """Seed the two prompts that follow this planning step.
+
+    Both open with a system block of their own and then copy the scratchpad,
+    so neither shares a prefix with this node's request. ``check_research_step``
+    starts the moment this node returns, so it is seeded only on the request
+    pass, which this node's own decode gives time to prefill.
+    ``conduct_research`` waits for the check as well, so it is seeded again
+    once the new step is known. The inputs mirror each target's own
+    ``invoke({...})``.
+    """
+    scratchpad = state.implementation_research_scratchpad + new_messages
+    if not new_messages:
+        prompt_seeds.seed(
+            config,
+            target="check_research_step",
+            prompt=check_research_prompt,
+            inputs={"implementation_research_scratchpad": scratchpad},
+            history_key="implementation_research_scratchpad",
+            event="check_research_step_seed",
+        )
+    prompt_seeds.seed(
+        config,
+        target="conduct_research",
+        prompt=conduct_research_prompt,
+        inputs={
+            "implementation_research_scratchpad": scratchpad,
+            "codebase_structure": _codebase_structure,
+        },
+        history_key="implementation_research_scratchpad",
+        tools=research_tools,
+        event="conduct_research_seed_extended" if new_messages else "conduct_research_seed",
+    )
+
+
+def _seed_extract_implementation_plan(state: SoftwareArchitectState, config: RunnableConfig, new_messages: List[AnyMessage], event: str) -> None:
+    """Seed ``extract_implementation_plan`` with the research so far.
+
+    Its prompt rewrites the whole scratchpad through
+    ``convert_tools_messages_to_ai_and_human`` behind its own system block, so
+    nothing cached can serve it. The rewrite is per message, so the seed of
+    any research turn is a prefix of the prompt it will send.
+    """
+    prompt_seeds.seed(
+        config,
+        target="extract_implementation_plan",
+        prompt=extract_implementation_prompt,
+        inputs={
+            "research_findings": convert_tools_messages_to_ai_and_human(
+                state.implementation_research_scratchpad + new_messages
+            ),
+            "codebase_structure": _codebase_structure,
+        },
+        history_key="research_findings",
+        event=event,
+    )
+
+
 def come_up_with_research_next_step(state: SoftwareArchitectState, config: RunnableConfig) -> ComeUpWithResearchNextStepOutput:
     """Generate the next research step based on the current state"""
+    _seed_after_planning(state, config, [])
     runnable = plan_next_step_prompt | configurable_model.with_structured_output(
         ResearchStep
     ).with_config(get_model_config(config, PLAN_MAX_TOKENS))
@@ -63,10 +127,11 @@ def come_up_with_research_next_step(state: SoftwareArchitectState, config: Runna
             "directory": "./workspace_repo"
         }),
     })
+    next_step = AIMessage(content=f"My next thing i need to check is {response.hypothesis}"
+                          f"This is why I think it is useful: {response.reasoning}")
+    _seed_after_planning(state, config, [next_step])
     return {"research_next_step": response.hypothesis,
-            "implementation_research_scratchpad": [
-                AIMessage(content=f"My next thing i need to check is {response.hypothesis}"
-                          f"This is why I think it is useful: {response.reasoning}")]}
+            "implementation_research_scratchpad": [next_step]}
 
 class CheckResearchStepOutput(TypedDict):
     is_valid_research_step: bool
@@ -93,6 +158,7 @@ def check_research_step(state: SoftwareArchitectState, config: RunnableConfig)->
 
 def conduct_research(state: SoftwareArchitectState, config: RunnableConfig):
     """Conduct research based on the proposed hypothesis"""
+    _seed_extract_implementation_plan(state, config, [], "extract_implementation_plan_seed")
     runnable = conduct_research_prompt | configurable_model.bind_tools(
         research_tools
     ).with_config(get_model_config(config, RESEARCH_MAX_TOKENS))
@@ -100,6 +166,11 @@ def conduct_research(state: SoftwareArchitectState, config: RunnableConfig):
         "implementation_research_scratchpad": state.implementation_research_scratchpad,
         "codebase_structure": get_files_structure.invoke({"directory": "./workspace_repo"})
     })
+    # Extend the seed by this reply only when a tool phase follows it: that
+    # is the gap it is prefilled in. With no tool calls, or at the turn cap,
+    # `should_call_tool` routes straight to extraction and there is none.
+    if response.tool_calls and state.tool_call_iterations + 1 < Configuration.from_runnable_config(config).max_react_tool_calls:
+        _seed_extract_implementation_plan(state, config, [response], "extract_implementation_plan_seed_extended")
     # Both counters advance here rather than in the router: a router may be
     # called more than once for one visit, and a count that is not exactly
     # "turns taken" makes the compiled limit rule predict the wrong exit.

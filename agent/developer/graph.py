@@ -9,6 +9,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.constants import END, START
 from langgraph.graph import  StateGraph
 from helpers.prompts import markdown_to_prompt_template
+from agent.common import prompt_seeds
 from agent.common.configuration import Configuration
 from agent.common.model import (
     DIFF_MAX_TOKENS,
@@ -70,7 +71,50 @@ def proceed_to_next_atomic_task(state: SoftwareDeveloperState):
     }
 
 
+def _seed_creating_diffs(state: SoftwareDeveloperState, config: RunnableConfig, new_messages: List[AnyMessage], event: str) -> None:
+    """Seed ``creating_diffs_for_task`` with the atomic research so far.
+
+    Its prompt puts the line-numbered file and the task behind its own system
+    block, then the research loop rewritten by
+    ``convert_tools_messages_to_ai_and_human`` -- so nothing cached can serve
+    it. The inputs mirror the target's own ``invoke({...})``, for whichever of
+    its two prompts it will pick. The file is read here, not on the seed
+    worker: it is rewritten by ``creating_diffs_for_task`` itself, and the
+    seed must see the content the target will read.
+    """
+    current_task = state.implementation_plan.tasks[state.current_task_idx]
+    current_atomic_task = current_task.atomic_tasks[state.current_atomic_task_idx]
+    file_path = current_task.file_path
+    inputs = {
+        "task": current_atomic_task.atomic_task,
+        "additional_context": current_atomic_task.additional_context,
+        "research": convert_tools_messages_to_ai_and_human(
+            list(state.atomic_implementation_research or []) + new_messages
+        ),
+        "file_path": file_path,
+    }
+    if not os.path.exists(file_path):
+        prompt = implement_new_file_prompt
+    else:
+        with open(file_path, "r") as file:
+            file_content = file.read()
+        lines = []
+        for i, line in enumerate(file_content.splitlines(), start=1):
+            lines.append(f"{i}| {line}")
+        inputs["file_content"] = "\n".join(lines)
+        prompt = extract_diffs_tasks_prompt
+    prompt_seeds.seed(
+        config,
+        target="creating_diffs_for_task",
+        prompt=prompt,
+        inputs=inputs,
+        history_key="research",
+        event=event,
+    )
+
+
 def get_clear_implementation_plan_for_atomic_task(state: SoftwareDeveloperState, config: RunnableConfig):
+    _seed_creating_diffs(state, config, [], "creating_diffs_for_task_seed")
     current_task = state.implementation_plan.tasks[state.current_task_idx]
     current_atomic_task = current_task.atomic_tasks[state.current_atomic_task_idx]
     runnable = get_clear_implementation_plan_prompt | configurable_model.bind_tools(
@@ -84,6 +128,10 @@ def get_clear_implementation_plan_for_atomic_task(state: SoftwareDeveloperState,
         "additional_context": current_atomic_task.additional_context,
         "atomic_implementation_research": state.atomic_implementation_research
     })
+    # As in the architect's `conduct_research`: extend the seed only when a
+    # tool phase follows this reply, which is the gap it is prefilled in.
+    if result.tool_calls and state.tool_call_iterations + 1 < Configuration.from_runnable_config(config).max_react_tool_calls:
+        _seed_creating_diffs(state, config, [result], "creating_diffs_for_task_seed_extended")
     return {
         "atomic_implementation_research": [result],
         "tool_call_iterations": state.tool_call_iterations + 1,
@@ -107,7 +155,7 @@ def should_continue_implementation_research(state: SoftwareDeveloperState, confi
     return "should_continue_research"
 
 
-def prepare_for_implementation(state: SoftwareDeveloperState):
+def prepare_for_implementation(state: SoftwareDeveloperState, config: RunnableConfig):
     """Read the code file content (if not new) and reset the research"""
     current_task = state.implementation_plan.tasks[state.current_task_idx]
     try:
@@ -115,9 +163,32 @@ def prepare_for_implementation(state: SoftwareDeveloperState):
             file_content = file.read()
     except FileNotFoundError:
         file_content = "This is a new file"
+    codebase_structure = get_files_structure.invoke({"directory": "./workspace_repo"})
+
+    # The first research turn's whole prompt is known here. Little lead --
+    # it starts as soon as this returns -- but its tree and file content are
+    # the bulk of the prompt, and a previous atomic task's request covers at
+    # most the part before the file. Mirrors the target's `invoke({...})`.
+    current_atomic_task = current_task.atomic_tasks[state.current_atomic_task_idx]
+    prompt_seeds.seed(
+        config,
+        target="get_clear_implementation_plan_for_atomic_task",
+        prompt=get_clear_implementation_plan_prompt,
+        inputs={
+            "development_task": current_atomic_task.atomic_task,
+            "file_content": file_content,
+            "target_file": current_task.file_path,
+            "codebase_structure": codebase_structure,
+            "additional_context": current_atomic_task.additional_context,
+            "atomic_implementation_research": [],
+        },
+        history_key="atomic_implementation_research",
+        tools=research_tools,
+        event="get_clear_implementation_plan_for_atomic_task_seed",
+    )
 
     return {"current_file_content": file_content,
-            "codebase_structure": get_files_structure.invoke({"directory": "./workspace_repo"}),
+            "codebase_structure": codebase_structure,
             "atomic_implementation_research": None,
             # The research pool is cleared here, so the turn counter that
             # bounds it has to be cleared with it -- otherwise the second
