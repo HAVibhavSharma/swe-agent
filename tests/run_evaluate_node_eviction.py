@@ -17,6 +17,7 @@ import itertools
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from collections import defaultdict
@@ -29,6 +30,11 @@ import asyncio
 from langgraph.checkpoint.memory import MemorySaver
 
 from langgraph.pregel._kv_forecast import KVForecastSession
+
+# `python tests/run_evaluate_node_eviction.py` -- how pitlane launches it --
+# puts tests/ on sys.path, not the repo root, so `agent` only imports if the
+# repo happens to be installed into the venv.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.graph import swe_agent_builder
 from agent.common.model import MODEL_NAME, MODEL_PROVIDER

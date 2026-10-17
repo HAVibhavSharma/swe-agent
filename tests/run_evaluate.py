@@ -17,6 +17,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 import uuid
 from collections import defaultdict
@@ -27,6 +28,11 @@ from typing import Any
 from dotenv import find_dotenv, load_dotenv
 import asyncio
 from langgraph.checkpoint.memory import MemorySaver
+
+# `python tests/run_evaluate.py` -- how pitlane launches it -- puts tests/ on
+# sys.path, not the repo root, so `agent` only imports if the repo happens to be
+# installed into the venv.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.graph import swe_agent_builder
 from agent.common import trace_store
