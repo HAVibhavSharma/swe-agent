@@ -15,6 +15,8 @@ Read in order:
 | [02-required-changes.md](02-required-changes.md) | What was changed in this repo and why; what is still missing before the prefetch arm is real; bugs found in the agent |
 | [03-running.md](03-running.md) | Step-by-step execution on the GPU box, including scoring the patches |
 | [04-harnesses.md](04-harnesses.md) | The three `tests/run_evaluate*.py` scripts: what each measures, flags, outputs |
+| [05-prefetch-flow.md](05-prefetch-flow.md) | How the fork decides to fire a prefetch and what it sends: stream trigger, agent_id, the gates that silence it |
+| [06-langgraph-fork-usage.md](06-langgraph-fork-usage.md) | Every place this repo depends on the `langgraph-dev` fork, at compile time and at run time |
 
 ## The 60-second version
 
