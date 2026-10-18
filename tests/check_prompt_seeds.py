@@ -60,7 +60,7 @@ def _reply(body: dict) -> dict:
         return {"content": json.dumps({"tasks": [
             {"file_path": "./workspace_repo/a.py", "logical_task": "edit",
              "atomic_tasks": [{"atomic_task": "rename x", "additional_context": "ctx"}]},
-            {"file_path": "./workspace_repo/new_mod.py", "logical_task": "add",
+            {"file_path": "./workspace_repo/newpkg/sub/new_mod.py", "logical_task": "add",
              "atomic_tasks": [{"atomic_task": "create it", "additional_context": ""}]},
         ]})}
     if node == "creating_diffs_for_task":
@@ -177,7 +177,7 @@ def main() -> int:
     check("the run reached creating_diffs_for_task for both tasks",
           _turns["creating_diffs_for_task"] == 2, str(dict(_turns)))
     check("the existing file was edited", (work / "workspace_repo" / "a.py").read_text().startswith("y = 1"))
-    check("the new file was created", (work / "workspace_repo" / "new_mod.py").exists())
+    check("the new file was created, in a directory that did not exist", (work / "workspace_repo" / "newpkg" / "sub" / "new_mod.py").exists())
 
     expected_targets = {
         "check_research_step", "conduct_research", "extract_implementation_plan",

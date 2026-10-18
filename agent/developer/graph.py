@@ -245,6 +245,10 @@ def creating_diffs_for_task(state: SoftwareDeveloperState, config: RunnableConfi
             "research": convert_tools_messages_to_ai_and_human(state.atomic_implementation_research),
             "file_path": file_path
         })
+        # A new file can sit in a directory that does not exist yet (a new
+        # locale, a new subpackage); without this the write raised
+        # FileNotFoundError and ended the instance.
+        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
         with open(file_path, "w") as file:
             file.write(new_file_content)
             file.flush()
