@@ -82,6 +82,7 @@ from urllib import error, request
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig
+from langsmith import tracing_context
 from langgraph.pregel._vllm_agent import (
     AGENT_UNIT_METADATA_KEY,
     derive_agent_id,
@@ -273,7 +274,20 @@ def _post(base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
     return json.loads(body) if body else {}
 
 
-def _build_and_send(
+def _build_and_send(**kwargs: Any) -> None:
+    """``_send_seed`` with LangSmith tracing off.
+
+    The worker thread does not inherit the node's run context, so with
+    LANGSMITH_TRACING on every prompt rendered and repo tree built for a seed
+    was traced as a root run of its own -- dozens of ChatPromptTemplate and
+    get_files_structure rows per question, outside the job's trace. A seed is
+    a side channel to the server, not part of the agent's work.
+    """
+    with tracing_context(enabled=False):
+        _send_seed(**kwargs)
+
+
+def _send_seed(
     *,
     event: str,
     producer_node: str | None,

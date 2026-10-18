@@ -221,6 +221,24 @@ def main() -> int:
     check("one log row per seed", len(rows) == len(SEEDS), f"{len(rows)} rows, {len(SEEDS)} seeds")
     check("no seed errored", all(row["error"] is None for row in rows))
 
+    # The seed worker is untraced. It runs on a thread that does not inherit the
+    # node's run, so with LangSmith on its prompt renders and repo-tree builds
+    # would each become a stray root run.
+    from langchain_core.callbacks.manager import CallbackManager
+
+    seen: list[list[str]] = []
+    send_seed = prompt_seeds._send_seed
+    prompt_seeds._send_seed = lambda **kwargs: seen.append(
+        [type(h).__name__ for h in CallbackManager.configure().handlers])
+    os.environ.update({"LANGSMITH_TRACING": "true", "LANGSMITH_API_KEY": "x",
+                       "LANGSMITH_ENDPOINT": base})
+    worker = threading.Thread(target=prompt_seeds._build_and_send)
+    worker.start()
+    worker.join()
+    os.environ["LANGSMITH_TRACING"] = "false"
+    prompt_seeds._send_seed = send_seed
+    check("the seed worker runs with no LangSmith tracer", seen == [[]], str(seen))
+
     # Off means off: nothing is posted once the prefetch path is disabled.
     sent = len(SEEDS)
     os.environ["SWE_PROMPT_SEEDS"] = "0"
