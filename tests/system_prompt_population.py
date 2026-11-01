@@ -55,12 +55,22 @@ still true prefix rather than a guess that matches nothing and fails silently.
 ``text_role`` follows the section's own role, because the chat template wraps a
 system block in different control tokens than a user block and a role mismatch
 records a prefix no real request can hit.
+
+Per instance: the repo tree and the issue
+-----------------------------------------
+Four nodes follow their system block with the checked-out repo's file tree,
+and the architect's nodes open their history with the issue text. Both are
+per instance and so cannot be seeded here. ``populate_instance_prompts``
+seeds each node again after the instance's workspace is materialized, with
+the longest prefix the instance fixes -- system block, tree, issue -- and the
+node's tools, as ``messages``. See ``_INSTANCE_PROMPTS``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from string import Formatter
 from typing import Any
@@ -114,6 +124,41 @@ def resolve_prefetch_url() -> str | None:
             root = root[: -len(suffix)]
             break
     return f"{root}{PREFETCH_PATH}"
+
+
+# ---------------------------------------------------------------------------
+# Registry key
+# ---------------------------------------------------------------------------
+# `0` writes the old exact key (`{namespace}:{node}`), which only reaches real
+# traffic through the server's `_resolve_registry_agent_id` fallback.
+_PATTERN_KEYS = (
+    os.getenv("SWE_SEED_AGENT_ID_PATTERN") or os.getenv("ODR_SEED_AGENT_ID_PATTERN") or "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _seed_agent_id(namespace: str, node: str) -> str:
+    """The registry key a seed is filed under, the same scheme as ODR's.
+
+    The seeding phase knows nodes by their bare runtime name, while live
+    traffic keys on ``{namespace}:{job}:{graph path}``, so no exact key the
+    seeder can write is the key a prefetch will ask for. The old
+    ``{namespace}:{node}`` form only worked through the server's fallback,
+    which fires solely when the requested id is *completely* empty; the moment
+    anything registers under the real id (a served prompt, a prompt seed) the
+    fallback stops firing and the seeds become unreachable.
+
+    A wildcard key says what is true: this prefix belongs to this node, in any
+    job, at any depth in the graph. ``*`` is one segment (the job id), ``**``
+    zero or more (the graph path). It is also how pitlane tells a population
+    phantom from a predicted one: a ``*`` in the agent id.
+
+    Requires a server with pattern keys, which answers ``pattern_agent_ids:
+    true``; ``populate_*`` checks it, because a wildcard key on a server
+    without them is a literal id nothing ever asks for.
+    """
+    if not _PATTERN_KEYS:
+        return f"{namespace}:{node}"
+    return f"{namespace}:*:**:{node}"
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +431,7 @@ async def populate_system_prompts(
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         for seed in seeds:
             node = seed["node"]
-            agent_id = f"{namespace}:{node}"
+            agent_id = _seed_agent_id(namespace, node)
             row: dict[str, Any] = {
                 "node": node,
                 "agent_id": agent_id,
@@ -450,18 +495,42 @@ async def populate_system_prompts(
                 )
             nodes.append(row)
 
+    result = _result(label, url, namespace, nodes, prefill_on_miss)
+    _report(result, record_to)
+    return result
+
+
+def _result(label: str, url: str, namespace: str, nodes: list[dict[str, Any]],
+            prefill_on_miss: bool) -> dict[str, Any]:
+    """The phase's outcome from its per-node rows."""
     seeded = [row for row in nodes if row.get("ok")]
+    # A wildcard key on a server that does not match patterns is worse than
+    # the old exact key: it is stored as a literal agent id, so the seed looks
+    # like it landed (200, available_prefixes 1) and is then invisible to
+    # every real prefetch. The endpoint advertises support; a run that seeded
+    # patterns without it is not ok, whatever the individual rows said.
+    pattern_ok = (not _PATTERN_KEYS) or all(
+        row.get("pattern_agent_ids") for row in seeded
+    )
     result = {
-        "ok": bool(seeded) and len(seeded) == len(nodes),
+        "ok": bool(seeded) and len(seeded) == len(nodes) and pattern_ok,
         "label": label,
         "url": url,
         "namespace": namespace,
+        "pattern_keys": _PATTERN_KEYS,
+        "pattern_agent_ids_supported": pattern_ok,
         "nodes_attempted": len(nodes),
         "nodes_seeded": len(seeded),
         "prefill_on_miss": prefill_on_miss,
         "nodes": nodes,
     }
-    _report(result, record_to)
+    if _PATTERN_KEYS and seeded and not pattern_ok:
+        result["reason"] = "server_lacks_pattern_agent_ids"
+        result["detail"] = (
+            "seeds were written under wildcard keys but the server did not "
+            "report pattern_agent_ids; they are unreachable. Re-run with "
+            "SWE_SEED_AGENT_ID_PATTERN=0 or update vLLM."
+        )
     return result
 
 
@@ -518,3 +587,277 @@ def _report(result: dict[str, Any], record_to: Path | None) -> None:
                 "    WARNING: the server recorded nothing for this node -- the "
                 "seed was shorter than one LMCache chunk, or the render failed"
             )
+
+
+# ---------------------------------------------------------------------------
+# Per instance: each node's longest prefix the instance fixes
+# ---------------------------------------------------------------------------
+# The startup phase seeds what every instance shares, each node's system
+# block. Two more things are fixed for a whole instance but exist only once it
+# does: the checked-out repo's file tree (`get_files_structure`), which four
+# nodes send right after their system block, and the issue text, which is the
+# first message of the architect's scratchpad and so opens the history of
+# every architect node. The tree is tens of thousands of characters against a
+# system block of a few hundred. So after each instance's checkout, and before
+# its first request, every node whose prompt reaches either is seeded again
+# with the longest prefix known at that point, under the same wildcard key as
+# the startup seed:
+#
+#   come_up_with_research_next_step   system, tree, "research so far", issue
+#   check_research_step               system, issue
+#   conduct_research                  system, tree, issue
+#   extract_implementation_plan       system, tree, issue
+#   get_clear_implementation_plan_    system, task preamble and tree,
+#     for_atomic_task                 cut at {file_content}
+#
+# Each stops where the run takes over: after the issue come the model's own
+# turns, and after the developer's tree the target file and the task, which
+# nothing knows until the plan exists. The developer rebuilds its tree per
+# task (`prepare_for_implementation`); it is the checkout's tree until a task
+# creates a file. The other developer prompts open with a field the plan
+# fills, so their startup seed is already all that is static.
+#
+# `agent_kind` is "non-react" for all of them, whatever the node is: the
+# server then drops the key's earlier entries -- the startup seed and the
+# previous instance's seed -- before recording this one, so a warm for the
+# node finds exactly this instance's prefix. (Only the seeding request is
+# non-react; the predictor's own warms still say what the node is.)
+#
+# (node, prompt "module:attribute", bound tools "module:attribute" or None).
+# The tools are the node's `bind_tools` list: the chat template renders them
+# into the system block, so a seed without them diverges before the tree.
+_INSTANCE_PROMPTS: tuple[tuple[str, str, str | None], ...] = (
+    (
+        "come_up_with_research_next_step",
+        "agent.architect.graph:plan_next_step_prompt",
+        None,
+    ),
+    (
+        "check_research_step",
+        "agent.architect.graph:check_research_prompt",
+        None,
+    ),
+    (
+        "conduct_research",
+        "agent.architect.graph:conduct_research_prompt",
+        "agent.architect.graph:research_tools",
+    ),
+    (
+        "extract_implementation_plan",
+        "agent.architect.graph:extract_implementation_prompt",
+        None,
+    ),
+    (
+        "get_clear_implementation_plan_for_atomic_task",
+        "agent.developer.graph:get_clear_implementation_plan_prompt",
+        "agent.developer.graph:research_tools",
+    ),
+)
+
+# The template field that carries the tree, and the directory every node lists.
+TREE_FIELD = "codebase_structure"
+WORKSPACE = "./workspace_repo"
+# History placeholders whose first message is the issue: the architect's
+# scratchpad, and `extract_implementation_plan`'s rewrite of it, which passes
+# human messages through unchanged.
+ISSUE_HISTORIES = frozenset({"implementation_research_scratchpad", "research_findings"})
+
+
+def instance_seed_messages(prompt: Any, tree: str, issue: str) -> list[Any]:
+    """``prompt``'s leading messages, as far as the instance fixes them.
+
+    Messages are rendered in order with ``tree`` as ``{codebase_structure}``,
+    and a history placeholder that opens with the issue becomes that one
+    message. The seed stops at the first thing the run decides: another field,
+    which cuts its message there (the static text before it is kept), or the
+    history after the issue. A cut message renders as a closed turn where the
+    real one goes on, so the server's chunk-aligned prefix ends a chunk or two
+    before the cut; everything before that matches token for token.
+
+    Raises when the prefix holds neither the tree nor the issue: that is the
+    startup seed, and seeding it again would only replace it.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_core.prompts import MessagesPlaceholder
+
+    out: list[Any] = []
+    per_instance = False
+    for message in getattr(prompt, "messages", None) or []:
+        if isinstance(message, MessagesPlaceholder):
+            if message.variable_name in ISSUE_HISTORIES:
+                out.append(HumanMessage(content=issue))
+                per_instance = True
+            break
+        template = getattr(getattr(message, "prompt", None), "template", None)
+        kind = type(message).__name__
+        if not isinstance(template, str):
+            break
+        if "System" in kind:
+            cls = SystemMessage
+        elif "Human" in kind:
+            cls = HumanMessage
+        else:
+            break
+        fields = [field for _, field, _, _ in Formatter().parse(template) if field]
+        text, blocked = _build_seed_text(template, {TREE_FIELD: tree})
+        filled = fields[: fields.index(blocked)] if blocked else fields
+        per_instance = per_instance or TREE_FIELD in filled
+        if text:
+            out.append(cls(content=text))
+        if blocked:
+            break
+    if not per_instance:
+        raise ValueError("the prefix holds neither the tree nor the issue")
+    return out
+
+
+def build_instance_seeds(tree: str, issue: str) -> list[dict[str, Any]]:
+    """One wire-format seed per node: ``messages``, and ``tools`` if bound.
+
+    Rendered with ChatOpenAI's own payload builder (``prompt_seeds._to_wire``),
+    the code that builds the real request, so the seed's leading messages and
+    tools are byte for byte what the node will send.
+    """
+    from agent.common.prompt_seeds import _to_wire
+
+    seeds: list[dict[str, Any]] = []
+    for node, prompt_target, tools_target in _INSTANCE_PROMPTS:
+        try:
+            messages = instance_seed_messages(_load(prompt_target), tree, issue)
+            tools = _load(tools_target) if tools_target else None
+            wire_messages, wire_tools = _to_wire(messages, tools)
+            seeds.append({
+                "node": node,
+                "prompt": prompt_target,
+                "messages": wire_messages,
+                "tools": wire_tools,
+            })
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            seeds.append({
+                "node": node,
+                "prompt": prompt_target,
+                "messages": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return seeds
+
+
+def _repo_tree() -> str:
+    """The tree every node will send for this instance, built the same way.
+
+    With LangSmith tracing off: the tool call would otherwise be traced as a
+    root run of its own, outside the job's trace.
+    """
+    from langsmith import tracing_context
+
+    from agent.tools.write import get_files_structure
+
+    with tracing_context(enabled=False):
+        return get_files_structure.invoke({"directory": WORKSPACE})
+
+
+async def populate_instance_prompts(
+    *,
+    label: str,
+    issue: str,
+    prefill_on_miss: bool = True,
+    record_to: Path | None = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Seed each node's prefix as far as this instance fixes it. Never raises.
+
+    ``issue`` is the instance's problem statement, the content of the first
+    message the graph is started with.
+
+    Run after the instance's workspace is materialized and before its first
+    request. With ``prefill_on_miss`` each seed is computed once and LMCache
+    stores it, so it is in LMCache when the instance starts; the caller flushes
+    HBM after this, so it is not on the GPU. ``wait`` holds each POST until its
+    phantom finishes, so the flush finds nothing in flight. One JSON line per
+    call is appended to ``record_to``.
+    """
+    started = time.perf_counter()
+    url = resolve_prefetch_url()
+    namespace = agent_namespace()
+    nodes: list[dict[str, Any]] = []
+    tree_chars = 0
+    issue_chars = len(issue)
+    if url is None:
+        result: dict[str, Any] = {"ok": False, "reason": "no_prefetch_url",
+                                  "label": label, "nodes": []}
+    else:
+        try:
+            tree = _repo_tree()
+            tree_chars = len(tree)
+            seeds = build_instance_seeds(tree, issue)
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            seeds = []
+            nodes.append({"node": None, "ok": False, "reason": "seed_build_failed",
+                          "detail": f"{type(exc).__name__}: {exc}"})
+
+        import httpx
+
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            for seed in seeds:
+                node = seed["node"]
+                row: dict[str, Any] = {
+                    "node": node,
+                    "agent_id": _seed_agent_id(namespace, node),
+                    "seed_messages": len(seed["messages"] or []),
+                    "seed_chars": sum(len(str(m.get("content") or ""))
+                                      for m in seed["messages"] or []),
+                    "seed_tools": len(seed.get("tools") or []),
+                }
+                if not seed["messages"]:
+                    row.update({"ok": False, "reason": "empty_seed",
+                                "detail": seed.get("error")})
+                    nodes.append(row)
+                    continue
+                payload: dict[str, Any] = {
+                    "agent_id": row["agent_id"],
+                    "agent_kind": "non-react",
+                    "messages": seed["messages"],
+                    "wait": True,
+                    "prefetch_top_k": 1,
+                    # The eviction index key the real request will present;
+                    # no job_id, as in the startup phase.
+                    "langgraph_node": node,
+                    "call_type": node,
+                    "prefill_on_miss": prefill_on_miss,
+                }
+                if seed.get("tools"):
+                    payload["tools"] = seed["tools"]
+                try:
+                    response = await client.post(url, json=payload)
+                    body = response.json()
+                    if not isinstance(body, dict):
+                        body = {"reason": "bad_payload", "body": body}
+                    row.update(body)
+                    row["status_code"] = response.status_code
+                    # A server that ignored `messages` warmed whatever the
+                    # registry held instead and recorded nothing new.
+                    row["ok"] = (response.status_code == 200
+                                 and bool(body.get("seeded_from_messages")))
+                except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                    row.update({"ok": False, "reason": "request_failed",
+                                "detail": f"{type(exc).__name__}: {exc}"})
+                nodes.append(row)
+        result = _result(label, url, namespace, nodes, prefill_on_miss)
+    result["tree_chars"] = tree_chars
+    result["issue_chars"] = issue_chars
+    result["seconds"] = round(time.perf_counter() - started, 3)
+
+    if record_to is not None:
+        record_to.parent.mkdir(parents=True, exist_ok=True)
+        with record_to.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(result) + "\n")
+    failed = [f"{row.get('node')} ({row.get('reason') or row.get('status_code')})"
+              for row in result.get("nodes", []) if not row.get("ok")]
+    print(
+        f"Instance prompt population: {result.get('nodes_seeded', 0)}/"
+        f"{len(_INSTANCE_PROMPTS)} nodes seeded with the {tree_chars}-char repo tree "
+        f"and the {issue_chars}-char issue in {result['seconds']} s"
+        + (f"; FAILED: {', '.join(failed)}" if failed else "")
+        + (f" ({result['reason']})" if result.get("reason") else "")
+    )
+    return result

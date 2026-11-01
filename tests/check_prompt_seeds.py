@@ -29,6 +29,9 @@ sys.path.insert(0, str(ROOT))
 
 CHAT: list[dict] = []
 SEEDS: list[dict] = []
+# The fork's own predicted warms: they name their issuer, and may carry the
+# prompt they warm, so they are told apart from a prompt seed by that.
+WARMS: list[dict] = []
 EVENTS: list[tuple[str, int]] = []  # ("chat" | "seed", index), in arrival order
 _events_lock = threading.Lock()
 _turns: dict[str, int] = defaultdict(int)
@@ -85,14 +88,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path.endswith("/echo"):  # the predictor's timing markers
+            return self._json({})
         if self.path.endswith("/agents/prefetch"):
-            if "messages" not in body:  # the fork's own predicted warm
+            if "messages" not in body or body.get("issuer"):
+                with _events_lock:
+                    WARMS.append(body)
                 return self._json({"submitted": 0})
             with _events_lock:
                 SEEDS.append(body)
                 EVENTS.append(("seed", len(SEEDS) - 1))
             return self._json({"seeded_from_messages": True, "prefill_on_miss": True,
-                               "submitted": 1, "scored": True})
+                               "pattern_agent_ids": True, "available_prefixes": 1,
+                               "submitted": 1, "completed": 1, "scored": True})
         with _events_lock:
             CHAT.append(body)
             EVENTS.append(("chat", len(CHAT) - 1))

@@ -249,9 +249,9 @@ def _emit(job_id: str | None, record: dict[str, Any]) -> None:
 def _post(base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
     """POST to ``/prefetch``.
 
-    Not ``warm_agent_prefixes``: this fork branch's version takes no
-    ``tools``, and two of the targets are tool-bound. The payload is otherwise
-    the one it builds. A server without the ``tools`` field ignores it, and
+    Not ``warm_agent_prefixes``: it predates that function's ``tools`` on
+    this branch, and a seed must carry them, since two of the targets are
+    tool-bound. The payload is otherwise the one it builds. A server without the ``tools`` field ignores it, and
     the seed then records a prefix the real request cannot hit -- the log row
     is where that shows.
     """

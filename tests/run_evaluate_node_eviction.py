@@ -43,7 +43,7 @@ try:
     # `python tests/run_evaluate_node_eviction.py` puts tests/ on sys.path...
     from batch_control import parse_only_questions, run_batch
     from kv_metrics_reset import reset_kv_metrics
-    from system_prompt_population import populate_system_prompts
+    from system_prompt_population import populate_instance_prompts, populate_system_prompts
     from swebench_instances import (
         append_prediction,
         collect_patch,
@@ -56,7 +56,7 @@ try:
 except ImportError:  # ...`python -m tests.run_evaluate_node_eviction` does not.
     from tests.batch_control import parse_only_questions, run_batch
     from tests.kv_metrics_reset import reset_kv_metrics
-    from tests.system_prompt_population import populate_system_prompts
+    from tests.system_prompt_population import populate_instance_prompts, populate_system_prompts
     from tests.swebench_instances import (
         append_prediction,
         collect_patch,
@@ -90,6 +90,13 @@ KV_METRICS_RESET_PATH = METRICS_DIR / "kv_metrics_reset.json"
 # phase that never hits is explained by the node whose seed did not stick, and
 # nothing else in the report says which one that was.
 SYSTEM_PROMPT_POPULATION_PATH = METRICS_DIR / "system_prompt_population.json"
+# One line per instance: each node's prefix as far as the instance fixes it --
+# system block, repo tree, issue -- seeded after its workspace is checked out;
+# see `populate_instance_prompts`.
+INSTANCE_PROMPT_POPULATION_PATH = METRICS_DIR / "instance_prompt_population.jsonl"
+# Set by main() from the population flags: the per-instance seeding is part of
+# the population phase, on and off with it.
+INSTANCE_POPULATION: dict[str, Any] = {"enabled": False, "prefill_on_miss": True, "flush_hbm": True}
 PREDICTION_DIR = Path(__file__).resolve().parents[1] / "SWE_predictions" / RUN_ID
 os.environ["LANGGRAPH_PREDICTION_LOG_DIR"] = str(PREDICTION_DIR)
 
@@ -560,6 +567,29 @@ async def target(
     except Exception as exc:  # noqa: BLE001
         setup_error = f"{type(exc).__name__}: {exc}"
 
+    # Each node's prefix as far as this instance fixes it -- system block, repo
+    # tree, issue -- into LMCache and then off the GPU: the instance meets it
+    # where the startup phase leaves the system blocks, in LMCache and not in
+    # HBM, in every arm that runs the population phase.
+    instance_population: dict[str, Any] | None = None
+    instance_flush: dict[str, Any] | None = None
+    if setup_error is None and INSTANCE_POPULATION["enabled"]:
+        instance_population = await populate_instance_prompts(
+            label=f"instance_prompt_population_job_{job_id}",
+            issue=problem_statement_message(instance)["content"],
+            prefill_on_miss=INSTANCE_POPULATION["prefill_on_miss"],
+            record_to=INSTANCE_PROMPT_POPULATION_PATH,
+        )
+        if INSTANCE_POPULATION["flush_hbm"]:
+            instance_flush = await reset_kv_metrics(
+                f"instance_prompt_population_job_{job_id}",
+                flush_hbm=True,
+                # As at the startup boundary: a seed's blocks can be held for
+                # the moment LMCache takes to confirm its store.
+                flush_attempts=20,
+                retry_wait_s=0.5,
+            )
+
     if setup_error is None:
         # INFO plus an initial PROB for every node in the graph -- including
         # nodes this job has not reached yet, so the policy can score a prefix
@@ -653,6 +683,19 @@ async def target(
             "setup_error": setup_error,
             "stream_error": stream_error,
             "state_error": state_error,
+            # Inside query_duration: the seeding runs after the clock starts.
+            "instance_population_ok": (
+                instance_population.get("ok") if instance_population else None
+            ),
+            "instance_population_seconds": (
+                instance_population.get("seconds") if instance_population else None
+            ),
+            "instance_population_tree_chars": (
+                instance_population.get("tree_chars") if instance_population else None
+            ),
+            "instance_population_hbm_flushed": (
+                instance_flush.get("hbm_flushed") if instance_flush else None
+            ),
             "final_state_present": final_state is not None,
             "empty_patch": not patch.strip(),
         },
@@ -749,6 +792,12 @@ async def _run_cold_phase_isolated(
 async def main():
     args = parse_args()
     selected = _select_instances(args)
+    INSTANCE_POPULATION.update(
+        enabled=not args.skip_system_prompt_population,
+        prefill_on_miss=args.prefill_on_miss,
+        # The flush is a parameter of the reset endpoint, as between instances.
+        flush_hbm=not args.no_hbm_flush and not args.no_kv_metrics_reset,
+    )
 
     _reconcile_graph_spec()
     print(f"Metrics directory: {METRICS_DIR}")
@@ -775,7 +824,8 @@ async def main():
         "run(s) per instance) -> system prompt population "
         f"({'SKIPPED' if args.skip_system_prompt_population else 'seeding'} "
         "the AgentPrefixRegistry"
-        f"{'' if args.prefill_on_miss else ', registry only'}) "
+        f"{'' if args.prefill_on_miss else ', registry only'}"
+        f"{'' if args.skip_system_prompt_population else '; each instance also seeds its repo tree and issue'}) "
         "-> POST /v1/kv_metrics/reset"
         f"{'' if args.no_hbm_flush else ' (+ HBM flush)'} "
         "-> warm (measured)"
@@ -832,6 +882,11 @@ async def main():
                 f"cold_done_{RUN_ID}",
                 flush_hbm=not args.no_hbm_flush,
                 record_to=KV_METRICS_RESET_PATH,
+                # A seed's blocks can still be held for the moment LMCache
+                # takes to confirm its store; up to 10 s of asking again
+                # rather than a warm phase that starts with them resident.
+                flush_attempts=20,
+                retry_wait_s=0.5,
             )
 
         # ---- warm phase ---------------------------------------------------

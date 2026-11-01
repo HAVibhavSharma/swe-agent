@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -72,6 +73,34 @@ def inject_langgraph_request_metadata(
             )
             if isinstance(agent_id, str) and agent_id:
                 payload["agent_id"] = agent_id
-                payload.setdefault("record_in_registry", True)
+                payload.setdefault(
+                    "record_in_registry",
+                    _records_in_registry(cast(str | None, node_name)),
+                )
 
     return payload
+
+
+# The nodes whose model is `.bind_tools(...)`: a ReAct loop, whose next turn
+# extends the prompt this one sent. The same two SWE_GRAPH_SPEC marks "react".
+REACT_NODES = frozenset({
+    "conduct_research",
+    "get_clear_implementation_plan_for_atomic_task",
+})
+
+
+def _records_in_registry(node_name: str | None) -> bool:
+    """Whether this call's prompt goes into the prefix registry.
+
+    ``SWE_REGISTRY_RECORD``, or its ``ODR_`` spelling, which is what pitlane
+    sets: ``all`` (the default) records every call, ``react`` only the
+    tool-bound nodes' -- the previous prompt a ReAct loop's next turn extends
+    -- and ``none`` nothing, which leaves the registry holding only what the
+    system prompt population phase seeded.
+    """
+    mode = os.getenv("SWE_REGISTRY_RECORD") or os.getenv("ODR_REGISTRY_RECORD") or "all"
+    if mode == "none":
+        return False
+    if mode == "react":
+        return node_name in REACT_NODES
+    return True

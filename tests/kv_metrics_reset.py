@@ -36,6 +36,7 @@ prints a warning when the two disagree.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -70,12 +71,46 @@ def resolve_reset_url() -> str | None:
     return f"{root}{RESET_PATH}"
 
 
+async def _post_reset(url: str, label: str, flush_hbm: bool,
+                      timeout_s: float) -> dict[str, Any]:
+    # Imported here so a run that never resets does not require httpx.
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            response = await client.post(
+                url,
+                params={
+                    "label": label,
+                    # Sent lower-case: FastAPI parses "True" too, but the
+                    # access log and any proxy in between read better with
+                    # the JSON spelling.
+                    "flush_hbm": "true" if flush_hbm else "false",
+                },
+            )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            payload = {"ok": False, "reason": "bad_payload", "body": payload}
+        return {**payload, "url": url, "status_code": response.status_code}
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        return {
+            "ok": False,
+            "reason": "request_failed",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "url": url,
+            "label": label,
+            "flush_hbm_requested": flush_hbm,
+        }
+
+
 async def reset_kv_metrics(
     label: str,
     *,
     flush_hbm: bool = True,
     record_to: Path | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    flush_attempts: int = 1,
+    retry_wait_s: float = 0.5,
 ) -> dict[str, Any]:
     """Mark the end of the cold phase on the server. Never raises.
 
@@ -97,34 +132,19 @@ async def reset_kv_metrics(
             "label": label,
         }
     else:
-        # Imported here so a run that never resets does not require httpx.
-        import httpx
-
-        try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
-                response = await client.post(
-                    url,
-                    params={
-                        "label": label,
-                        # Sent lower-case: FastAPI parses "True" too, but the
-                        # access log and any proxy in between read better with
-                        # the JSON spelling.
-                        "flush_hbm": "true" if flush_hbm else "false",
-                    },
-                )
-            payload = response.json()
-            if not isinstance(payload, dict):
-                payload = {"ok": False, "reason": "bad_payload", "body": payload}
-            result = {**payload, "url": url, "status_code": response.status_code}
-        except Exception as exc:  # noqa: BLE001 - reported, never fatal
-            result = {
-                "ok": False,
-                "reason": "request_failed",
-                "detail": f"{type(exc).__name__}: {exc}",
-                "url": url,
-                "label": label,
-                "flush_hbm_requested": flush_hbm,
-            }
+        # A refused flush (blocks still referenced) is asked again: right
+        # after a population phase a seed's blocks can still be held for the
+        # moment LMCache takes to confirm its store. Each attempt opens a new
+        # epoch, which is harmless here because nothing is measured between
+        # them.
+        attempt = 1
+        result = await _post_reset(url, label, flush_hbm, timeout_s)
+        while (flush_hbm and attempt < flush_attempts and result.get("ok")
+               and str(result.get("hbm_flushed")) == "false"):
+            await asyncio.sleep(retry_wait_s)
+            attempt += 1
+            result = await _post_reset(url, label, flush_hbm, timeout_s)
+        result["flush_attempts"] = attempt
 
     if record_to is not None:
         record_to.parent.mkdir(parents=True, exist_ok=True)
