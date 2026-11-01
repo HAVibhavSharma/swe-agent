@@ -43,6 +43,7 @@ try:
     # `python tests/run_evaluate_node_eviction.py` puts tests/ on sys.path...
     from batch_control import parse_only_questions, run_batch
     from kv_metrics_reset import reset_kv_metrics
+    from lmcache_l1_flush import flush_lmcache_l1
     from system_prompt_population import populate_instance_prompts, populate_system_prompts
     from swebench_instances import (
         append_prediction,
@@ -56,6 +57,7 @@ try:
 except ImportError:  # ...`python -m tests.run_evaluate_node_eviction` does not.
     from tests.batch_control import parse_only_questions, run_batch
     from tests.kv_metrics_reset import reset_kv_metrics
+    from tests.lmcache_l1_flush import flush_lmcache_l1
     from tests.system_prompt_population import populate_instance_prompts, populate_system_prompts
     from tests.swebench_instances import (
         append_prediction,
@@ -94,6 +96,9 @@ SYSTEM_PROMPT_POPULATION_PATH = METRICS_DIR / "system_prompt_population.json"
 # system block, repo tree, issue -- seeded after its workspace is checked out;
 # see `populate_instance_prompts`.
 INSTANCE_PROMPT_POPULATION_PATH = METRICS_DIR / "instance_prompt_population.jsonl"
+# One line per question: LMCache's L2 writes drained and L1 cleared before it
+# starts, when LMCACHE_L1_FLUSH_URL is set; see tests/lmcache_l1_flush.py.
+LMCACHE_L1_FLUSH_PATH = METRICS_DIR / "lmcache_l1_flush.jsonl"
 # Set by main() from the population flags: the per-instance seeding is part of
 # the population phase, on and off with it.
 INSTANCE_POPULATION: dict[str, Any] = {"enabled": False, "prefill_on_miss": True, "flush_hbm": True}
@@ -590,6 +595,15 @@ async def target(
                 retry_wait_s=0.5,
             )
 
+    # Then LMCache's L1 too, once its L2 writes are done: the question starts
+    # with every seed on disk and none in L1, in every arm alike. Off unless
+    # LMCACHE_L1_FLUSH_URL is set.
+    l1_flush: dict[str, Any] | None = None
+    if setup_error is None:
+        l1_flush = await flush_lmcache_l1(
+            f"before_job_{job_id}", record_to=LMCACHE_L1_FLUSH_PATH
+        )
+
     if setup_error is None:
         # INFO plus an initial PROB for every node in the graph -- including
         # nodes this job has not reached yet, so the policy can score a prefix
@@ -696,6 +710,8 @@ async def target(
             "instance_population_hbm_flushed": (
                 instance_flush.get("hbm_flushed") if instance_flush else None
             ),
+            "lmcache_l1_flush_ok": l1_flush.get("ok") if l1_flush else None,
+            "lmcache_l1_flush_seconds": l1_flush.get("seconds") if l1_flush else None,
             "final_state_present": final_state is not None,
             "empty_patch": not patch.strip(),
         },
