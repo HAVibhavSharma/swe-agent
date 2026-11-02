@@ -25,11 +25,18 @@ Modes (``SWE_TRACE_MODE``, or ``ODR_TRACE_MODE``)
 -------------------------------------------------
 ``off``      Default. No interception.
 ``record``   Live calls, every request/response appended to the trace.
-``pinned``   Live call issued for timing and allowed to run to its own
-             stopping point; the recorded response is returned to the agent.
-             ``SWE_TRACE_PIN_LENGTH=1`` caps it at the recorded completion
-             length instead, bounding decode cost above at the price of
-             truncating a response that wanted to be longer.
+``pinned``   Live call issued for timing; the recorded response is returned to
+             the agent. By default the live call decodes the recorded number of
+             tokens *exactly*, as ODR's replay does: the length fields cap it
+             above and ``ignore_eos``/``min_tokens`` hold it open below, which
+             requires stripping the decode constraints first (see
+             ``_force_exact_tokens``). Without that, greedy decoding still stops
+             wherever this run's arithmetic puts EOS -- the same prompt gave 525
+             tokens in one run and 787 in the next -- and two arms' decode
+             times differ for reasons that have nothing to do with the arms.
+             ``SWE_TRACE_PINNED_EXACT_TOKENS=0`` turns that off: the live call
+             then runs to its own stopping point, or with
+             ``SWE_TRACE_PIN_LENGTH=1`` is only capped at the recorded length.
 ``offline``  No server contact; recorded response returned immediately. Cheap
              way to check that a code change keeps the trajectory intact.
 
@@ -39,8 +46,11 @@ Environment (``SWE_`` prefix preferred, ``ODR_`` accepted for parity with ODR)
 ``SWE_TRACE_PATH``     trace JSONL (read in pinned/offline, written in record)
 ``SWE_TRACE_ON_MISS``  ``strict`` (fail the call with a non-retryable 400) or
                        ``live`` (fall back to a real call, default)
-``SWE_TRACE_PIN_LENGTH``  ``1`` caps the pinned live call at the recorded
-                       completion length (default off, uncapped)
+``SWE_TRACE_PINNED_EXACT_TOKENS``  default ``1``: the pinned live call decodes
+                       exactly the recorded completion length; ``0`` leaves it
+                       to ``SWE_TRACE_PIN_LENGTH``
+``SWE_TRACE_PIN_LENGTH``  with exact tokens off, ``1`` caps the pinned live call
+                       at the recorded completion length (default off, uncapped)
 ``SWE_TRACE_REPORT``   divergence report JSONL; defaults next to the trace
 
 Interception is at the HTTP layer, not the LangChain call sites, because the
@@ -83,6 +93,29 @@ FULL_LENGTH_DIRNAME = "trace_full_length"
 # Request fields that identify the *work* being asked for. Everything else
 # (job_id, thread_id, agent id, streaming plumbing) varies run to run without
 # changing what the model is asked to do, so it must stay out of the key.
+# Every field that can make a request stop early or constrain what it may emit.
+# An exact-length timing call has to be free of all of them: a grammar makes EOS
+# the only legal token once the JSON closes, so suppressing EOS under one gets
+# the request aborted ("grammar rejected tokens [...]") behind an already-sent
+# 200. The same list as ODR's trace_store.
+_DECODE_CONSTRAINT_FIELDS = (
+    "response_format",
+    "structured_outputs",
+    "guided_json",
+    "guided_regex",
+    "guided_choice",
+    "guided_grammar",
+    "guided_decoding",
+    "guided_decoding_backend",
+    "guided_whitespace_pattern",
+    # Older builds (vllm-continuum) take a structural tag as a top-level
+    # request field rather than only via response_format.
+    "structural_tag",
+    "structural_tag_schema",
+    "stop",
+    "stop_token_ids",
+)
+
 _KEYED_FIELDS = (
     "model",
     "messages",
@@ -123,6 +156,9 @@ class TraceConfig:
     # live call runs to its own stopping point, so a response that wants more
     # tokens than the baseline is allowed to produce them.
     pin_length: bool
+    # Decode exactly the recorded completion length (on by default). Wins over
+    # `pin_length`, which only matters with this off.
+    exact_tokens: bool = False
 
 
 _config: TraceConfig | None = None
@@ -214,6 +250,9 @@ def _resolve() -> TraceConfig:
         Path(full_length) if full_length else Path.cwd() / FULL_LENGTH_DIRNAME
     )
     pin_length = _env("TRACE_PIN_LENGTH", "0").lower() in {"1", "true", "yes", "on"}
+    exact_tokens = _env("TRACE_PINNED_EXACT_TOKENS", "1").lower() not in {
+        "0", "false", "no", "off",
+    }
     return TraceConfig(
         mode,
         path,
@@ -222,6 +261,7 @@ def _resolve() -> TraceConfig:
         early_exit_dir,
         full_length_dir,
         pin_length,
+        exact_tokens,
     )
 
 
@@ -332,6 +372,7 @@ class _TraceTransportBase:
         self._early_exit_dir = cfg.early_exit_dir or Path.cwd() / EARLY_EXIT_DIRNAME
         self._full_length_dir = cfg.full_length_dir or Path.cwd() / FULL_LENGTH_DIRNAME
         self._pin_length = cfg.pin_length
+        self._exact_tokens = cfg.exact_tokens
         self._store = TraceStore(cfg.path) if self._mode in {"pinned", "offline"} else None
         self._write_lock = threading.Lock()
 
@@ -620,23 +661,37 @@ class _TraceTransportBase:
         body: dict[str, Any],
         entry: dict[str, Any],
         is_stream: bool,
-    ) -> tuple[httpx.Request, int | None, int | None]:
+    ) -> tuple[httpx.Request, int | None, int | None, bool]:
         """The live call to issue for timing.
 
-        Returns ``(request, cap, baseline_completion_tokens)``. By default there
-        is no cap: the live call decodes until it stops on its own, so a
-        response that needs more tokens than the recording used is not truncated
-        mid-stream. That makes the timing arm an honest measurement of what this
-        stack does with this prompt, at the price of a decode that can run
-        longer than the baseline's -- ``baseline_completion_tokens`` is reported
-        alongside the live count so the gap is visible either way.
+        Returns ``(request, cap, baseline_completion_tokens, exact)``. By
+        default (``SWE_TRACE_PINNED_EXACT_TOKENS``, on) the live call decodes
+        exactly the recorded number of tokens, so every arm replaying the trace
+        pays for the same decode and only what the serving stack does
+        differently shows in the timing; ``exact`` says it was asked to.
 
-        ``SWE_TRACE_PIN_LENGTH=1`` restores the cap for a run that would rather
-        bound decode cost above than see the whole output.
+        With that off there is no cap by default: the live call decodes until
+        it stops on its own, at the price of a decode that can run longer or
+        shorter than the baseline's -- ``baseline_completion_tokens`` is
+        reported alongside the live count so the gap is visible either way.
+        ``SWE_TRACE_PIN_LENGTH=1`` then restores the cap alone.
         """
         baseline_tokens = self._completion_tokens(
             entry["response_body"], entry.get("stream", is_stream)
         )
+        if self._exact_tokens and baseline_tokens:
+            pinned_body = self._force_exact_tokens(dict(body), baseline_tokens)
+            raw = json.dumps(pinned_body).encode("utf-8")
+            headers = [
+                (name, value)
+                for name, value in request.headers.raw
+                if name.lower() != b"content-length"
+            ]
+            headers.append((b"content-length", str(len(raw)).encode()))
+            live_request = httpx.Request(
+                request.method, request.url, headers=headers, content=raw
+            )
+            return live_request, baseline_tokens, baseline_tokens, True
         if not self._pin_length:
             # Send the request exactly as the agent wrote it.
             raw = json.dumps(body).encode("utf-8")
@@ -649,7 +704,7 @@ class _TraceTransportBase:
             live_request = httpx.Request(
                 request.method, request.url, headers=headers, content=raw
             )
-            return live_request, None, baseline_tokens
+            return live_request, None, baseline_tokens, False
 
         pinned_body = dict(body)
         completion_tokens = baseline_tokens
@@ -678,7 +733,39 @@ class _TraceTransportBase:
             request.method, request.url, headers=headers, content=raw
         )
         limit = pinned_body.get("max_completion_tokens", pinned_body.get("max_tokens"))
-        return live_request, limit, baseline_tokens
+        return live_request, limit, baseline_tokens, False
+
+    @staticmethod
+    def _force_exact_tokens(body: dict[str, Any], completion_tokens: int) -> dict[str, Any]:
+        """Make the timing call decode exactly ``completion_tokens`` tokens.
+
+        ODR's replay, ported: a ceiling alone (``max_tokens``) only bounds
+        decode from above, and the live call still stops at its own EOS. To pin
+        the count from below as well the request has to be free of every
+        early-stop mechanism first -- under a grammar, EOS is the only legal
+        token once the JSON closes, and suppressing it gets the request aborted
+        behind an already-sent 200.
+
+        So: cap both length fields (vLLM honours max_completion_tokens over the
+        deprecated max_tokens), drop the decode constraints, downgrade a forced
+        tool call to ``auto`` (that is what builds the tool grammar), then hold
+        decoding open with ``ignore_eos`` + ``min_tokens``.
+
+        ``tools`` deliberately stays: it is rendered into the chat template, so
+        removing it would change the prompt -- and the prefix-cache behaviour
+        this study measures. What the timing call no longer pays for is the
+        structured-output logits processor; its output is discarded either way.
+        """
+        forced = dict(body)
+        forced["max_tokens"] = completion_tokens
+        forced["max_completion_tokens"] = completion_tokens
+        for field in _DECODE_CONSTRAINT_FIELDS:
+            forced.pop(field, None)
+        if forced.get("tools") and forced.get("tool_choice") not in (None, "auto", "none"):
+            forced["tool_choice"] = "auto"
+        forced["ignore_eos"] = True
+        forced["min_tokens"] = completion_tokens
+        return forced
 
     def _report_pinned(
         self,
@@ -694,6 +781,7 @@ class _TraceTransportBase:
         elapsed_ns: int,
         pinned_limit: int | None,
         baseline_tokens: int | None,
+        exact_tokens: bool = False,
     ) -> None:
         live_completion_tokens: int | None = None
         if live_text is not None:
@@ -775,9 +863,15 @@ class _TraceTransportBase:
                 "reason": "pinned",
                 "live_status": live_status,
                 "live_latency_ns": elapsed_ns,
-                # None unless SWE_TRACE_PIN_LENGTH=1: by default the live
-                # call is not capped.
+                # The recorded length when the live call was pinned to it
+                # (exactly, or capped with SWE_TRACE_PIN_LENGTH=1); None when it
+                # ran uncapped.
                 "pinned_max_tokens": pinned_limit,
+                # True when the live call was held to exactly the recorded
+                # length (ignore_eos + min_tokens). Then a live count that
+                # differs from pinned_max_tokens is a pin that did not hold, and
+                # pitlane counts the request as off-pin.
+                "pinned_exact_tokens": exact_tokens,
                 # Fidelity of the timing call, against the recording rather than
                 # against a cap: equal counts mean the live run decoded exactly
                 # as much as the baseline, fewer means it stopped earlier, more
@@ -854,9 +948,9 @@ class AsyncTraceTransport(_TraceTransportBase, httpx.AsyncBaseTransport):
             return self._replayed_response(request, entry)
 
         # pinned: issue the real call so the serving stack is exercised and
-        # timed, cap it at the baseline's output length, then discard what it
+        # timed, pin it to the baseline's output length, then discard what it
         # produced in favour of the recording.
-        live_request, pinned_limit, baseline_tokens = self._pinned_request(
+        live_request, pinned_limit, baseline_tokens, exact_tokens = self._pinned_request(
             request, body, entry, is_stream
         )
         started = time.perf_counter_ns()
@@ -886,6 +980,7 @@ class AsyncTraceTransport(_TraceTransportBase, httpx.AsyncBaseTransport):
             elapsed_ns=elapsed,
             pinned_limit=pinned_limit,
             baseline_tokens=baseline_tokens,
+            exact_tokens=exact_tokens,
         )
         return self._replayed_response(request, entry)
 
@@ -946,7 +1041,7 @@ class SyncTraceTransport(_TraceTransportBase, httpx.BaseTransport):
         if self._mode == "offline":
             return self._replayed_response(request, entry)
 
-        live_request, pinned_limit, baseline_tokens = self._pinned_request(
+        live_request, pinned_limit, baseline_tokens, exact_tokens = self._pinned_request(
             request, body, entry, is_stream
         )
         started = time.perf_counter_ns()
@@ -975,6 +1070,7 @@ class SyncTraceTransport(_TraceTransportBase, httpx.BaseTransport):
             elapsed_ns=elapsed,
             pinned_limit=pinned_limit,
             baseline_tokens=baseline_tokens,
+            exact_tokens=exact_tokens,
         )
         return self._replayed_response(request, entry)
 
