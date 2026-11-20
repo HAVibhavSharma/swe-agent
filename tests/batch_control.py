@@ -9,6 +9,7 @@ drives both workflows with the same flags:
                                  instance's full-run job id
 ``--hbm-flush-between-queries``  flush GPU HBM after every instance, not only
                                  before the first
+``--max-concurrency``            run up to this many instances at once (default 1)
 
 An interrupt lands on an instance boundary: the first SIGINT/SIGTERM lets the
 instance in flight finish and stops there, so a resume picks up at the next
@@ -116,6 +117,8 @@ async def run_batch(
     flush_between: bool = False,
     set_next_job_id: Callable[[int], None] | None = None,
     label: str = "warm",
+    max_concurrency: int = 1,
+    take_job_id: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     """Run every selected instance ``completions_per_instance`` times, in order.
 
@@ -123,7 +126,21 @@ async def run_batch(
     runs one completion; ``on_row`` gets each result as it lands. Skipped instances -- finished on an earlier attempt,
     or outside ``only_questions`` -- keep their place, so every index (and with
     it every job id) is what an uninterrupted full run would have had.
+
+    ``max_concurrency`` above 1 starts instances in the same order but keeps
+    up to that many in flight, each in its own workspace (``run_one``'s job).
+    Job ids are drawn from ``take_job_id`` in index order before any job starts
+    (a subset uses the full-run ids, as serially), so they are the ids a serial
+    run would have used and pinned replay still finds the recordings.
     """
+    if max_concurrency < 1:
+        raise SystemExit(f"--max-concurrency {max_concurrency}: must be 1 or more")
+    if max_concurrency > 1 and flush_between:
+        # The prefix-cache reset refuses while neighbours hold blocks, and one
+        # that got through would evict their working set mid-question.
+        raise SystemExit("--hbm-flush-between-queries cannot be used with --max-concurrency above 1")
+    if max_concurrency > 1 and completions_per_instance != 1:
+        raise SystemExit("--max-concurrency above 1 needs --completions-per-instance 1")
     already_done, highest_job_id = read_completed_log(completed_log)
     if highest_job_id and set_next_job_id is not None:
         # Continue the numbering rather than restarting it: reusing an id
@@ -167,6 +184,56 @@ async def run_batch(
     job_ids: dict[int, list[str]] = {index: [] for index, _ in pending}
     total = len(pending) * completions_per_instance
     position = 0
+    if max_concurrency > 1:
+        slots = asyncio.Semaphore(max_concurrency)
+        started = 0
+
+        async def one(index: int, instance: dict[str, Any], job_id: str | None) -> None:
+            nonlocal started
+            # Semaphore waiters wake in arrival order and the tasks are created
+            # in index order, so instances start (and take job ids) in order.
+            async with slots:
+                if stop_requested:
+                    return
+                started += 1
+                print(f"[{label} {started}/{total}] {instance['instance_id']} run 1 "
+                      f"(up to {max_concurrency} at once)", flush=True)
+                row = await run_one(
+                    instance,
+                    logical_job_index=index,
+                    instance_index=1,
+                    fixed_job_id=job_id,
+                )
+                rows.append(row)
+                on_row(row)
+                job_ids[index].append(str(row.get("job_id", "")))
+                append_completed_log(completed_log, index, job_ids[index])
+
+        def job_id_for(index: int) -> str | None:
+            if only_questions is not None:
+                return str(index)
+            return take_job_id() if take_job_id is not None else None
+
+        try:
+            ids = [job_id_for(index) for index, _ in pending]
+            tasks = [asyncio.create_task(one(index, instance, job_id))
+                     for (index, instance), job_id in zip(pending, ids)]
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            errors = [o for o in outcomes if isinstance(o, BaseException)]
+            if errors:
+                raise errors[0]
+        finally:
+            for signum in installed:
+                loop.remove_signal_handler(signum)
+        return {
+            "rows": rows,
+            "drained": stop_requested and started < total,
+            "between_query_flushes": 0,
+            "between_query_flushes_ok": 0,
+            "skipped_already_done": len(already_done),
+            "max_concurrency": max_concurrency,
+        }
+
     try:
         # Round-robin, as the harness always ran: every instance once, then
         # every instance again. An instance counts as done after its last

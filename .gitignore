@@ -81,3 +81,6 @@ workspace_repo/
 # Pinned-replay side-by-side dumps (see agent/common/trace_store.py)
 trace_early_exits/
 trace_full_length/
+
+# Per-job checkouts for --max-concurrency runs
+workspaces_concurrent/

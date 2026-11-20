@@ -2,6 +2,8 @@ from langchain_core.tools import tool
 import os
 from pathlib import Path
 
+from agent.common.workspace import fs_path, ws_exists, ws_makedirs, ws_open
+
 # What the repo tree lists. Every node's prompt carries it, and on a large repo
 # gitingest's full listing -- docs, fixtures, images, every test data file --
 # was most of a 131k-token context on its own (django's ran a planning call to
@@ -67,9 +69,9 @@ def create_file(path: str, content: str) -> str:
     try:
         # Check if file already exists
         # Ensure the directory exists
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ws_makedirs(os.path.dirname(path), exist_ok=True)
 
-        with open(path, "w", encoding="utf-8") as f:
+        with ws_open(path, "w", encoding="utf-8") as f:
             f.write(content)
         return f"Successfully created file at {path}"
     except Exception as e:
@@ -89,10 +91,10 @@ def write_to_file(path: str, content: str) -> str:
         str: A success message with the file path, or an error message if writing failed
     """
     try:
-        if not os.path.exists(path):
+        if not ws_exists(path):
             return f"Error: File {path} does not exist"
 
-        with open(path, "w", encoding="utf-8") as f:
+        with ws_open(path, "w", encoding="utf-8") as f:
             f.write(content)
         return f"Successfully overridden file at {path}"
     except Exception as e:
@@ -110,7 +112,7 @@ def get_files_structure(directory: str = "./workspace_repo") -> str:
     Returns:
         str: A string representing the hierarchical directory structure and file listing
     """
-    root = Path(directory)
+    root = Path(fs_path(directory))
     lines = _source_tree(root)
     tree = "Directory structure:\n" + f"└── {root.resolve().name}/\n" + "".join(f"    {line}\n" for line in lines)
     if len(tree) > _TREE_MAX_CHARS:

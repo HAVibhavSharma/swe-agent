@@ -125,6 +125,55 @@ async def main() -> int:
     except SystemExit:
         check("--only-questions needs one completion per instance", True)
 
+    # --max-concurrency: in order, never more than K in flight, ids as serial.
+    class Concurrent(Harness):
+        def __init__(self) -> None:
+            super().__init__()
+            self.live = 0
+            self.peak = 0
+
+        async def run_one(self, instance, **kwargs):
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+            try:
+                # Uneven lengths, so jobs finish out of order.
+                await asyncio.sleep(0.02 * (6 - kwargs["logical_job_index"]))
+                return await super().run_one(instance, **kwargs)
+            finally:
+                self.live -= 1
+
+    FLUSHES.clear()
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "completed.jsonl"
+        h = Concurrent()
+        out = await batch_control.run_batch(
+            SAMPLE, completions_per_instance=1, run_one=h.run_one,
+            completed_log=log, max_concurrency=2, take_job_id=lambda: str(next(h.counter)),
+        )
+        check("concurrent: every instance runs once", sorted(i for i, _, _ in h.calls) == [1, 2, 3, 4, 5],
+              str(h.calls))
+        check("concurrent: job ids match a serial run", sorted((i, j) for i, _, j in h.calls)
+              == [(i, str(i)) for i in range(1, 6)], str(h.calls))
+        check("concurrent: never more than 2 in flight", h.peak == 2, f"peak {h.peak}")
+        check("concurrent: no flushes", FLUSHES == [], str(FLUSHES))
+        check("concurrent: every instance logged", batch_control.read_completed_log(log)[0] == {1, 2, 3, 4, 5})
+        check("concurrent: reported", out["max_concurrency"] == 2 and out["drained"] is False)
+    h = Concurrent()
+    await batch_control.run_batch(
+        SAMPLE, completions_per_instance=1, run_one=h.run_one,
+        only_questions=batch_control.parse_only_questions("2,5", len(SAMPLE), 1), max_concurrency=4,
+    )
+    check("concurrent subset keeps full-run ids", sorted((i, j) for i, _, j in h.calls) == [(2, "2"), (5, "5")],
+          str(h.calls))
+    for kwargs, why in (({"flush_between": True}, "with the between-question flush"),
+                        ({"completions_per_instance": 2}, "with more than one completion")):
+        try:
+            await batch_control.run_batch(SAMPLE, run_one=Harness().run_one, max_concurrency=2,
+                                          **{"completions_per_instance": 1, **kwargs})
+            check(f"concurrent is rejected {why}", False)
+        except SystemExit:
+            check(f"concurrent is rejected {why}", True)
+
     print(f"\n{'all checks passed' if not FAILURES else f'{len(FAILURES)} FAILED'}")
     return 1 if FAILURES else 0
 

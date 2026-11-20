@@ -3,6 +3,8 @@ import re
 
 from langchain_core.tools import tool
 
+from agent.common.workspace import display_path, fs_path
+
 
 def search_in_file(file_path, search_term, context=2):
     """
@@ -19,8 +21,8 @@ def search_in_file(file_path, search_term, context=2):
         print(f"Could not read {file_path}: {e}")
         return results
 
-    # Get absolute path
-    abs_path = os.path.abspath(file_path)
+    # Get absolute path, as a serial run's checkout would spell it
+    abs_path = display_path(os.path.abspath(file_path))
 
     # compile a case-insensitive regex pattern for the search term
     pattern = re.compile(re.escape(search_term), re.IGNORECASE)
@@ -95,7 +97,7 @@ def search_keyword_in_directory(directory: str, search_term: str, context: int =
         search_term: Term to search for in files contents (case-insensitive)
         context: Number of context lines to include before and after match (default: 2)
     """
-    full_directory = get_full_path(directory)
+    full_directory = fs_path(get_full_path(directory))
     return search_directory(full_directory, search_term, extension=".py", context=context)
 
 # List of available tools

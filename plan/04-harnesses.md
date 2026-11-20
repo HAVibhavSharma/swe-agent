@@ -121,5 +121,10 @@ tests/eviction_logs/<RUN_ID>/
   FAIL_TO_PASS and PASS_TO_PASS in a container. Use it.
 - **No Tavily-style response cache.** Every tool here reads a checkout pinned to
   `base_commit`, so the inputs are already reproducible.
-- **No `--max-concurrency`.** One shared `./workspace_repo`; see
+- **`--max-concurrency` in `run_evaluate_node_eviction.py` only.** Above 1 each
+  job gets its own checkout under `workspaces_concurrent/job_<id>/workspace_repo`
+  and `agent/common/workspace.py` redirects the agent's file access there,
+  keeping every path the model sees as a serial run printed it, so a serial
+  trace still replays. The per-question HBM and L1 flushes are skipped (L1 is
+  flushed once before the batch); see
   [02-required-changes.md](02-required-changes.md#d-known-limits-of-the-harness-as-written).

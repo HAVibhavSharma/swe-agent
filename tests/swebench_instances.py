@@ -10,9 +10,11 @@ LangGraph agent into a SWE-bench run:
    agent hard-codes ``./workspace_repo`` in four places
    (architect/graph.py, developer/graph.py, tools/write.py), so rather than
    rewrite those, each job wipes and re-creates that directory at the
-   instance's ``base_commit``. Jobs run one at a time, so a single shared
-   workspace is not a race -- and one workspace is what keeps the harness's
-   determinism story simple.
+   instance's ``base_commit``. Jobs run one at a time by default, so a single
+   shared workspace is not a race. With ``--max-concurrency`` above 1 each job
+   gets its own checkout (``job_workspace``) and agent/common/workspace.py
+   redirects the agent's file access to it, leaving every path it prints as
+   the serial run printed it.
 3. **Collect** the patch: whatever the agent wrote to disk, as a diff against
    ``base_commit``.
 4. **Emit** ``predictions.jsonl`` in the schema ``swebench eval`` reads.
@@ -167,46 +169,60 @@ def _ensure_mirror(repo: str, base_commit: str) -> Path:
     return mirror
 
 
-def materialize_workspace(instance: dict[str, Any]) -> Path:
-    """Put ``instance`` on disk at ``WORKSPACE_DIR``, at its base commit.
+def job_workspace(job_id: str) -> Path:
+    """A job's own checkout, for runs with several jobs at once.
+
+    Beside the shared one, so it sits on the same filesystem (os.walk order,
+    and so the search tool's output, follows the filesystem), and named
+    ``workspace_repo`` so the repo tree's root line is the same as a serial
+    run's. agent/common/workspace.py points the agent's ``./workspace_repo``
+    at it.
+    """
+    return WORKSPACE_DIR.parent / "workspaces_concurrent" / f"job_{job_id}" / WORKSPACE_DIR.name
+
+
+def materialize_workspace(instance: dict[str, Any], root: Path | None = None) -> Path:
+    """Put ``instance`` on disk at ``root`` (default ``WORKSPACE_DIR``), at its base commit.
 
     Destructive by design: the previous instance's edits must not survive into
     this one, and a `git checkout .` would leave untracked files the agent
     created behind.
     """
+    root = root or WORKSPACE_DIR
     repo = instance["repo"]
     base_commit = instance["base_commit"]
     mirror = _ensure_mirror(repo, base_commit)
 
-    if WORKSPACE_DIR.exists():
-        shutil.rmtree(WORKSPACE_DIR)
-    WORKSPACE_DIR.parent.mkdir(parents=True, exist_ok=True)
+    if root.exists():
+        shutil.rmtree(root)
+    root.parent.mkdir(parents=True, exist_ok=True)
 
     # Local clone: git hard-links objects, so this costs almost nothing after
     # the first instance of a repo.
-    _git("clone", "--quiet", "--no-checkout", str(mirror), str(WORKSPACE_DIR))
-    _git("checkout", "--quiet", "--detach", base_commit, cwd=WORKSPACE_DIR)
+    _git("clone", "--quiet", "--no-checkout", str(mirror), str(root))
+    _git("checkout", "--quiet", "--detach", base_commit, cwd=root)
     # Identity is needed only so `git stash`/`commit` style operations do not
     # fail if something downstream tries one; the harness itself only diffs.
-    _git("config", "user.email", "bench@localhost", cwd=WORKSPACE_DIR)
-    _git("config", "user.name", "swe-agent-bench", cwd=WORKSPACE_DIR)
-    return WORKSPACE_DIR
+    _git("config", "user.email", "bench@localhost", cwd=root)
+    _git("config", "user.name", "swe-agent-bench", cwd=root)
+    return root
 
 
 # ---------------------------------------------------------------------------
 # 3. Collecting the patch
 # ---------------------------------------------------------------------------
-def collect_patch() -> str:
+def collect_patch(root: Path | None = None) -> str:
     """Everything the agent changed, as a diff against the base commit.
 
     Staged first so files the agent *created* are included -- a plain
     `git diff` would silently drop new files, which is a large share of what
     an implementation agent produces.
     """
-    if not WORKSPACE_DIR.exists():
+    root = root or WORKSPACE_DIR
+    if not root.exists():
         return ""
-    _git("add", "-A", cwd=WORKSPACE_DIR)
-    return _git("diff", "--cached", "--no-color", cwd=WORKSPACE_DIR, check=False)
+    _git("add", "-A", cwd=root)
+    return _git("diff", "--cached", "--no-color", cwd=root, check=False)
 
 
 def patch_stats(patch: str) -> dict[str, int]:

@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.graph import swe_agent_builder
 from agent.common.model import MODEL_NAME, MODEL_PROVIDER
+from agent.common.workspace import set_job_root
 
 try:
     # `python tests/run_evaluate_node_eviction.py` puts tests/ on sys.path...
@@ -48,6 +49,7 @@ try:
     from swebench_instances import (
         append_prediction,
         collect_patch,
+        job_workspace,
         load_instances,
         load_instances_file,
         materialize_workspace,
@@ -62,6 +64,7 @@ except ImportError:  # ...`python -m tests.run_evaluate_node_eviction` does not.
     from tests.swebench_instances import (
         append_prediction,
         collect_patch,
+        job_workspace,
         load_instances,
         load_instances_file,
         materialize_workspace,
@@ -102,6 +105,12 @@ LMCACHE_L1_FLUSH_PATH = METRICS_DIR / "lmcache_l1_flush.jsonl"
 # Set by main() from the population flags: the per-instance seeding is part of
 # the population phase, on and off with it.
 INSTANCE_POPULATION: dict[str, Any] = {"enabled": False, "prefill_on_miss": True, "flush_hbm": True}
+# Set by main() from --max-concurrency. Above 1 every job has its own checkout
+# (agent/common/workspace.py) and the per-question flushes are skipped: with
+# neighbours in flight an HBM flush is refused (their blocks are held), and an
+# L1 flush would empty the neighbours' L1 mid-question. L1 is flushed once,
+# before the first question, instead.
+CONCURRENCY = 1
 PREDICTION_DIR = Path(__file__).resolve().parents[1] / "SWE_predictions" / RUN_ID
 os.environ["LANGGRAPH_PREDICTION_LOG_DIR"] = str(PREDICTION_DIR)
 
@@ -405,6 +414,19 @@ def parse_args() -> argparse.Namespace:
             "one before it left resident -- measuring a cache it did not build."
         ),
     )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=1,
+        help=(
+            "Instances in flight at once (default 1, one after another). Above "
+            "1 each job gets its own checkout under workspaces_concurrent/, the "
+            "agent's ./workspace_repo is redirected to it with every printed "
+            "path unchanged (so a serial trace still replays), the per-question "
+            "HBM and L1 flushes are skipped, and L1 is flushed once before the "
+            "first question. Cannot be combined with --hbm-flush-between-queries."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -567,8 +589,13 @@ async def target(
     # the matching `start` in order to close the node out on the forecast.
     forecast_task_nodes: dict[str, str] = {}
 
+    # Concurrent jobs each get a checkout of their own; this task's context
+    # points the agent's ./workspace_repo at it (agent/common/workspace.py).
+    workspace = job_workspace(job_id) if CONCURRENCY > 1 else None
+    if workspace is not None:
+        set_job_root(workspace)
     try:
-        materialize_workspace(instance)
+        materialize_workspace(instance, workspace)
     except Exception as exc:  # noqa: BLE001
         setup_error = f"{type(exc).__name__}: {exc}"
 
@@ -585,7 +612,7 @@ async def target(
             prefill_on_miss=INSTANCE_POPULATION["prefill_on_miss"],
             record_to=INSTANCE_PROMPT_POPULATION_PATH,
         )
-        if INSTANCE_POPULATION["flush_hbm"]:
+        if INSTANCE_POPULATION["flush_hbm"] and CONCURRENCY == 1:
             instance_flush = await reset_kv_metrics(
                 f"instance_prompt_population_job_{job_id}",
                 flush_hbm=True,
@@ -599,7 +626,7 @@ async def target(
     # with every seed on disk and none in L1, in every arm alike. Off unless
     # LMCACHE_L1_FLUSH_URL is set.
     l1_flush: dict[str, Any] | None = None
-    if setup_error is None:
+    if setup_error is None and CONCURRENCY == 1:
         l1_flush = await flush_lmcache_l1(
             f"before_job_{job_id}", record_to=LMCACHE_L1_FLUSH_PATH
         )
@@ -646,7 +673,7 @@ async def target(
             except Exception as exc:
                 state_error = str(exc)
             try:
-                patch = collect_patch()
+                patch = collect_patch(workspace)
             except Exception as exc:  # noqa: BLE001
                 state_error = state_error or f"patch_collect: {exc}"
 
@@ -806,7 +833,9 @@ async def _run_cold_phase_isolated(
 
 
 async def main():
+    global CONCURRENCY
     args = parse_args()
+    CONCURRENCY = args.max_concurrency
     selected = _select_instances(args)
     INSTANCE_POPULATION.update(
         enabled=not args.skip_system_prompt_population,
@@ -831,7 +860,8 @@ async def main():
         f"max_atomic_tasks={max_atomic_tasks}"
     )
     print(
-        f"Running {len(selected)} instances sequentially, "
+        f"Running {len(selected)} instances "
+        f"{'sequentially' if CONCURRENCY == 1 else f'up to {CONCURRENCY} at once'}, "
         f"{args.completions_per_instance} run(s) each"
     )
     print(
@@ -906,6 +936,11 @@ async def main():
             )
 
         # ---- warm phase ---------------------------------------------------
+        if CONCURRENCY > 1:
+            # Once for the whole batch: per question it would empty the L1 of
+            # the questions already in flight. Off unless LMCACHE_L1_FLUSH_URL
+            # is set.
+            await flush_lmcache_l1("before_concurrent_batch", record_to=LMCACHE_L1_FLUSH_PATH)
         print(f"Warm phase: measuring, report goes to {METRICS_DIR}")
         # Resume, subsets, per-instance HBM flushes and interrupts at an
         # instance boundary: tests/batch_control.py.
@@ -922,6 +957,8 @@ async def main():
             # cannot reset cannot flush either.
             flush_between=args.hbm_flush_between_queries and not args.no_kv_metrics_reset,
             set_next_job_id=_continue_job_ids,
+            max_concurrency=CONCURRENCY,
+            take_job_id=lambda: str(next(job_counter)),
         )
         warm_rows = batch["rows"]
 
@@ -933,6 +970,7 @@ async def main():
             "skipped_already_done": batch["skipped_already_done"],
             "sampled_instances": len(selected),
             "completions_per_instance": args.completions_per_instance,
+            "max_concurrency": CONCURRENCY,
             "completed_runs": len(warm_rows),
             "failed_runs": sum(1 for row in warm_rows if not row["success"]),
             "empty_patch_runs": sum(1 for row in warm_rows if row["empty_patch"]),

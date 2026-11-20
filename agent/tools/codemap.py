@@ -3,6 +3,8 @@ from typing import Optional
 from langchain_core.tools import tool
 from tree_sitter_languages import get_language, get_parser
 
+from agent.common.workspace import ws_open
+
 @tool(parse_docstring=True)
 def get_code_definitions(file_path: str) -> str:
     """
@@ -30,7 +32,7 @@ def get_code_definitions(file_path: str) -> str:
     parser = get_parser(lang)
 
     # Read file content
-    with open(file_path, "rb") as f:
+    with ws_open(file_path, "rb") as f:
         code = f.read()
     tree = parser.parse(code)
 
@@ -126,7 +128,7 @@ def get_function_implementation(file_path: str, function_name: str) -> Optional[
     parser = get_parser(lang)
 
     # Read file content
-    with open(file_path, "rb") as f:
+    with ws_open(file_path, "rb") as f:
         code = f.read()
     tree = parser.parse(code)
 
@@ -206,7 +208,7 @@ def get_raw_file_content(file_path: str) -> str:
     Args:
         file_path: file path to read
      """
-    with open(file_path, "rb") as f:
+    with ws_open(file_path, "rb") as f:
         return f.read().decode('utf-8')
 
 # List of available tools

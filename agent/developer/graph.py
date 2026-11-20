@@ -10,6 +10,7 @@ from langgraph.constants import END, START
 from langgraph.graph import  StateGraph
 from helpers.prompts import markdown_to_prompt_template
 from agent.common import prompt_seeds
+from agent.common.workspace import ws_exists, ws_makedirs, ws_open
 from agent.common.configuration import Configuration
 from agent.common.model import (
     DIFF_MAX_TOKENS,
@@ -94,10 +95,10 @@ def _seed_creating_diffs(state: SoftwareDeveloperState, config: RunnableConfig, 
         ),
         "file_path": file_path,
     }
-    if not os.path.exists(file_path):
+    if not ws_exists(file_path):
         prompt = implement_new_file_prompt
     else:
-        with open(file_path, "r") as file:
+        with ws_open(file_path, "r") as file:
             file_content = file.read()
         lines = []
         for i, line in enumerate(file_content.splitlines(), start=1):
@@ -160,7 +161,7 @@ def prepare_for_implementation(state: SoftwareDeveloperState, config: RunnableCo
     """Read the code file content (if not new) and reset the research"""
     current_task = state.implementation_plan.tasks[state.current_task_idx]
     try:
-        with open(current_task.file_path, "r") as file:
+        with ws_open(current_task.file_path, "r") as file:
             file_content = file.read()
     except FileNotFoundError:
         file_content = "This is a new file"
@@ -233,7 +234,7 @@ def creating_diffs_for_task(state: SoftwareDeveloperState, config: RunnableConfi
     file_path = current_task.file_path
 
     # check if file is new
-    if not os.path.exists(file_path):
+    if not ws_exists(file_path):
         create_new_file_runnable = (
             implement_new_file_prompt
             | configurable_model.with_config(get_model_config(config, NEW_FILE_MAX_TOKENS))
@@ -248,13 +249,13 @@ def creating_diffs_for_task(state: SoftwareDeveloperState, config: RunnableConfi
         # A new file can sit in a directory that does not exist yet (a new
         # locale, a new subpackage); without this the write raised
         # FileNotFoundError and ended the instance.
-        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-        with open(file_path, "w") as file:
+        ws_makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+        with ws_open(file_path, "w") as file:
             file.write(new_file_content)
             file.flush()
     else:
         # Get the diffs
-        with open(file_path, "r") as file:
+        with ws_open(file_path, "r") as file:
             file_content = file.read()
         # add line numbers
         lines = []
@@ -289,7 +290,7 @@ def creating_diffs_for_task(state: SoftwareDeveloperState, config: RunnableConfi
                 re.DOTALL,
             )
             if match:
-                with open(file_path, "r") as f:
+                with ws_open(file_path, "r") as f:
                     file_content = f.read()
                 original_code = match.group(1).strip()
                 edited_code = match.group(2).strip()
@@ -302,7 +303,7 @@ def creating_diffs_for_task(state: SoftwareDeveloperState, config: RunnableConfi
                     + edited_code.splitlines()
                     + new_content[last_line:]
                 )
-                with open(file_path, "w") as f:
+                with ws_open(file_path, "w") as f:
                     f.write("\n".join(new_content))
                     f.flush()
 

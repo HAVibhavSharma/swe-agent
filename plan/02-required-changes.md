@@ -170,11 +170,14 @@ and `get_clear_implementation_plan_for_atomic_task` with no fork change.
 
 ## D. Known limits of the harness as written
 
-1. **One workspace, so jobs are strictly sequential.** The agent hard-codes
-   `./workspace_repo` in four places, so `tests/swebench_instances.py` wipes and
-   re-creates that one directory per job. ODR's `--max-concurrency` has no
-   equivalent until the workspace is per job (which needs the agent's path
-   references parameterised).
+1. **One workspace by default, so jobs run one after another.** The agent
+   hard-codes `./workspace_repo` in four places, so `tests/swebench_instances.py`
+   wipes and re-creates that one directory per job. `--max-concurrency N`
+   (`run_evaluate_node_eviction.py`) gives each job its own checkout instead:
+   a context variable set per job (`agent/common/workspace.py`) maps the
+   agent's file access to it, while prompts, tool arguments, tool output and
+   error text keep the serial spelling, so a serially recorded trace replays
+   byte for byte. The harness's other runners are still serial only.
 2. **No test execution.** The agent never runs the repo's tests, so there is no
    repair loop — it writes a patch and stops. Scoring happens afterwards, out of
    process, via `swebench eval`. That keeps Docker off the GPU box, and keeps a
