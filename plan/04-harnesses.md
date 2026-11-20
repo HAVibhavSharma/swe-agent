@@ -125,6 +125,7 @@ tests/eviction_logs/<RUN_ID>/
   job gets its own checkout under `workspaces_concurrent/job_<id>/workspace_repo`
   and `agent/common/workspace.py` redirects the agent's file access there,
   keeping every path the model sees as a serial run printed it, so a serial
-  trace still replays. The per-question HBM and L1 flushes are skipped (L1 is
-  flushed once before the batch); see
+  trace still replays. Every instance is checked out and seeded up front, then
+  HBM and L1 are flushed once, so each question starts as a serial one does;
+  nothing is flushed between questions. See
   [02-required-changes.md](02-required-changes.md#d-known-limits-of-the-harness-as-written).

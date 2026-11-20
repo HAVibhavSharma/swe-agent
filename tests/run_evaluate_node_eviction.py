@@ -42,7 +42,7 @@ from agent.common.workspace import set_job_root
 
 try:
     # `python tests/run_evaluate_node_eviction.py` puts tests/ on sys.path...
-    from batch_control import parse_only_questions, run_batch
+    from batch_control import parse_only_questions, read_completed_log, run_batch
     from kv_metrics_reset import reset_kv_metrics
     from lmcache_l1_flush import flush_lmcache_l1
     from system_prompt_population import populate_instance_prompts, populate_system_prompts
@@ -57,7 +57,7 @@ try:
         problem_statement_message,
     )
 except ImportError:  # ...`python -m tests.run_evaluate_node_eviction` does not.
-    from tests.batch_control import parse_only_questions, run_batch
+    from tests.batch_control import parse_only_questions, read_completed_log, run_batch
     from tests.kv_metrics_reset import reset_kv_metrics
     from tests.lmcache_l1_flush import flush_lmcache_l1
     from tests.system_prompt_population import populate_instance_prompts, populate_system_prompts
@@ -106,11 +106,16 @@ LMCACHE_L1_FLUSH_PATH = METRICS_DIR / "lmcache_l1_flush.jsonl"
 # the population phase, on and off with it.
 INSTANCE_POPULATION: dict[str, Any] = {"enabled": False, "prefill_on_miss": True, "flush_hbm": True}
 # Set by main() from --max-concurrency. Above 1 every job has its own checkout
-# (agent/common/workspace.py) and the per-question flushes are skipped: with
+# (agent/common/workspace.py) and no flush runs between questions: with
 # neighbours in flight an HBM flush is refused (their blocks are held), and an
-# L1 flush would empty the neighbours' L1 mid-question. L1 is flushed once,
-# before the first question, instead.
+# L1 flush would empty the neighbours' L1 mid-question. Instead every
+# instance's checkout and seeds are prepared before the first question starts
+# (`_prepare_concurrent`), followed by one HBM flush and one L1 flush, so each
+# question still starts the way a serial one does: its seeds on disk, none on
+# the GPU or in L1.
 CONCURRENCY = 1
+# logical_job_index -> {"workspace": Path, "setup_error": str | None}
+PREPARED: dict[int, dict[str, Any]] = {}
 PREDICTION_DIR = Path(__file__).resolve().parents[1] / "SWE_predictions" / RUN_ID
 os.environ["LANGGRAPH_PREDICTION_LOG_DIR"] = str(PREDICTION_DIR)
 
@@ -380,6 +385,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(prefill_on_miss=True)
     parser.add_argument("--no-hbm-flush", action="store_true")
+    parser.add_argument(
+        "--hbm-flush",
+        action="store_true",
+        help=(
+            "Flush GPU HBM after the population phase. Already the default "
+            "(--no-hbm-flush turns it off); defined so that pitlane's flag is "
+            "not taken by argparse as an abbreviation of "
+            "--hbm-flush-between-queries, which it silently was."
+        ),
+    )
     parser.add_argument("--no-kv-metrics-reset", action="store_true")
     # Batch control, spelled as open_deep_research's harness spells it because
     # pitlane drives both with the same flags and sniffs this file for them.
@@ -422,9 +437,10 @@ def parse_args() -> argparse.Namespace:
             "Instances in flight at once (default 1, one after another). Above "
             "1 each job gets its own checkout under workspaces_concurrent/, the "
             "agent's ./workspace_repo is redirected to it with every printed "
-            "path unchanged (so a serial trace still replays), the per-question "
-            "HBM and L1 flushes are skipped, and L1 is flushed once before the "
-            "first question. Cannot be combined with --hbm-flush-between-queries."
+            "path unchanged (so a serial trace still replays). Every instance "
+            "is checked out and seeded before the first question, then HBM and "
+            "L1 are flushed once; nothing is flushed between questions. Cannot "
+            "be combined with --hbm-flush-between-queries."
         ),
     )
     return parser.parse_args()
@@ -589,15 +605,20 @@ async def target(
     # the matching `start` in order to close the node out on the forecast.
     forecast_task_nodes: dict[str, str] = {}
 
-    # Concurrent jobs each get a checkout of their own; this task's context
-    # points the agent's ./workspace_repo at it (agent/common/workspace.py).
-    workspace = job_workspace(job_id) if CONCURRENCY > 1 else None
+    # Concurrent jobs each get a checkout of their own, already prepared and
+    # seeded by `_prepare_concurrent`; this task's context points the agent's
+    # ./workspace_repo at it (agent/common/workspace.py).
+    prepared = PREPARED.get(logical_job_index) if CONCURRENCY > 1 else None
+    workspace = prepared["workspace"] if prepared else (job_workspace(job_id) if CONCURRENCY > 1 else None)
     if workspace is not None:
         set_job_root(workspace)
-    try:
-        materialize_workspace(instance, workspace)
-    except Exception as exc:  # noqa: BLE001
-        setup_error = f"{type(exc).__name__}: {exc}"
+    if prepared:
+        setup_error = prepared["setup_error"]
+    else:
+        try:
+            materialize_workspace(instance, workspace)
+        except Exception as exc:  # noqa: BLE001
+            setup_error = f"{type(exc).__name__}: {exc}"
 
     # Each node's prefix as far as this instance fixes it -- system block, repo
     # tree, issue -- into LMCache and then off the GPU: the instance meets it
@@ -605,7 +626,7 @@ async def target(
     # HBM, in every arm that runs the population phase.
     instance_population: dict[str, Any] | None = None
     instance_flush: dict[str, Any] | None = None
-    if setup_error is None and INSTANCE_POPULATION["enabled"]:
+    if setup_error is None and INSTANCE_POPULATION["enabled"] and not prepared:
         instance_population = await populate_instance_prompts(
             label=f"instance_prompt_population_job_{job_id}",
             issue=problem_statement_message(instance)["content"],
@@ -812,6 +833,50 @@ async def _run_phase(
     return rows
 
 
+async def _prepare_concurrent(
+    selected: list[dict[str, Any]],
+    only_questions: set[int] | None,
+    completed_log: Path | None,
+) -> None:
+    """Every pending instance's checkout and seeds, then one flush, before any question.
+
+    The serial order -- check out, seed, flush HBM, flush L1, run -- per
+    question would flush the neighbours' cache mid-question, so with several in
+    flight the first four steps run for all of them up front. Each question
+    then starts as a serial one does: its seeds in LMCache on disk, nothing on
+    the GPU or in L1, and later questions find whatever their neighbours left.
+    """
+    done, _ = read_completed_log(completed_log)
+    for index, instance in enumerate(selected, start=1):
+        if index in done or (only_questions is not None and index not in only_questions):
+            continue
+        workspace = job_workspace(str(index))
+        entry: dict[str, Any] = {"workspace": workspace, "setup_error": None}
+        set_job_root(workspace)
+        try:
+            materialize_workspace(instance, workspace)
+        except Exception as exc:  # noqa: BLE001
+            entry["setup_error"] = f"{type(exc).__name__}: {exc}"
+        if entry["setup_error"] is None and INSTANCE_POPULATION["enabled"]:
+            await populate_instance_prompts(
+                label=f"instance_prompt_population_job_{index}",
+                issue=problem_statement_message(instance)["content"],
+                prefill_on_miss=INSTANCE_POPULATION["prefill_on_miss"],
+                record_to=INSTANCE_PROMPT_POPULATION_PATH,
+            )
+        set_job_root(None)
+        PREPARED[index] = entry
+    if INSTANCE_POPULATION["enabled"] and INSTANCE_POPULATION["flush_hbm"]:
+        await reset_kv_metrics(
+            "instance_prompt_population_concurrent",
+            flush_hbm=True,
+            flush_attempts=20,
+            retry_wait_s=0.5,
+        )
+    # Off unless LMCACHE_L1_FLUSH_URL is set.
+    await flush_lmcache_l1("before_concurrent_batch", record_to=LMCACHE_L1_FLUSH_PATH)
+
+
 def _continue_job_ids(first: int) -> None:
     global job_counter
     job_counter = itertools.count(first)
@@ -936,11 +1001,16 @@ async def main():
             )
 
         # ---- warm phase ---------------------------------------------------
+        only_questions = parse_only_questions(
+            args.only_questions, len(selected), args.completions_per_instance
+        )
+        flush_between = args.hbm_flush_between_queries and not args.no_kv_metrics_reset
         if CONCURRENCY > 1:
-            # Once for the whole batch: per question it would empty the L1 of
-            # the questions already in flight. Off unless LMCACHE_L1_FLUSH_URL
-            # is set.
-            await flush_lmcache_l1("before_concurrent_batch", record_to=LMCACHE_L1_FLUSH_PATH)
+            if flush_between:
+                # Refused here, before a minute per instance of seeding, rather
+                # than by run_batch afterwards.
+                raise SystemExit("--hbm-flush-between-queries cannot be used with --max-concurrency above 1")
+            await _prepare_concurrent(selected, only_questions, args.completed_log)
         print(f"Warm phase: measuring, report goes to {METRICS_DIR}")
         # Resume, subsets, per-instance HBM flushes and interrupts at an
         # instance boundary: tests/batch_control.py.
@@ -950,12 +1020,10 @@ async def main():
             run_one=lambda instance, **kwargs: target(instance, phase=PHASE_WARM, **kwargs),
             on_row=lambda row: _append_csv_row(_phase_e2e_csv_path(PHASE_WARM), _e2e_csv_row(row)),
             completed_log=args.completed_log,
-            only_questions=parse_only_questions(
-                args.only_questions, len(selected), args.completions_per_instance
-            ),
+            only_questions=only_questions,
             # The flush is a parameter of the reset endpoint, so an arm that
             # cannot reset cannot flush either.
-            flush_between=args.hbm_flush_between_queries and not args.no_kv_metrics_reset,
+            flush_between=flush_between,
             set_next_job_id=_continue_job_ids,
             max_concurrency=CONCURRENCY,
             take_job_id=lambda: str(next(job_counter)),
