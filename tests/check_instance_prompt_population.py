@@ -163,6 +163,14 @@ def main() -> int:
     os.environ["ODR_REGISTRY_RECORD"] = "all"
     check("the SWE_ spelling wins over ODR_", not meta._records_in_registry("conduct_research"))
 
+    # Instances seeded side by side (--max-concurrency): each under its own job,
+    # or a non-react seed replaces the shared key and every job warms the last.
+    seeds_before = len(fake.SEEDS)
+    asyncio.run(population.populate_instance_prompts(label="job 9", issue=issue, job_id="9"))
+    check("job_id: each seed filed under that job alone",
+          [s["agent_id"] for s in fake.SEEDS[seeds_before:]]
+          == [f"langgraph:9:**:{node}" for node in nodes])
+
     seeds_before = len(fake.SEEDS)
     os.environ["SWE_SEED_AGENT_ID_PATTERN"] = "0"
     import importlib

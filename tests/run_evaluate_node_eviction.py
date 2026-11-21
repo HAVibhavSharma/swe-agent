@@ -23,7 +23,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import find_dotenv, load_dotenv
 import asyncio
@@ -845,13 +845,24 @@ async def _prepare_concurrent(
     flight the first four steps run for all of them up front. Each question
     then starts as a serial one does: its seeds in LMCache on disk, nothing on
     the GPU or in L1, and later questions find whatever their neighbours left.
+
+    Each instance's seeds are filed under its own job id (`_seed_agent_id`):
+    seeded side by side under one key, every job would warm the instance
+    seeded last. The ids are drawn here, the way `run_batch` draws them --
+    the question index with --only-questions, else the job counter, resumed
+    past the completed log -- and `_prepared_job_ids` hands the same ones to
+    `run_batch`, so a seed's key is the job that runs it.
     """
-    done, _ = read_completed_log(completed_log)
+    done, highest_job_id = read_completed_log(completed_log)
+    if highest_job_id:
+        _continue_job_ids(highest_job_id + 1)
     for index, instance in enumerate(selected, start=1):
         if index in done or (only_questions is not None and index not in only_questions):
             continue
+        job_id = str(index) if only_questions is not None else str(next(job_counter))
         workspace = job_workspace(str(index))
-        entry: dict[str, Any] = {"workspace": workspace, "setup_error": None}
+        entry: dict[str, Any] = {"workspace": workspace, "setup_error": None,
+                                 "job_id": job_id}
         set_job_root(workspace)
         try:
             materialize_workspace(instance, workspace)
@@ -859,10 +870,11 @@ async def _prepare_concurrent(
             entry["setup_error"] = f"{type(exc).__name__}: {exc}"
         if entry["setup_error"] is None and INSTANCE_POPULATION["enabled"]:
             await populate_instance_prompts(
-                label=f"instance_prompt_population_job_{index}",
+                label=f"instance_prompt_population_job_{job_id}",
                 issue=problem_statement_message(instance)["content"],
                 prefill_on_miss=INSTANCE_POPULATION["prefill_on_miss"],
                 record_to=INSTANCE_PROMPT_POPULATION_PATH,
+                job_id=job_id,
             )
         set_job_root(None)
         PREPARED[index] = entry
@@ -880,6 +892,14 @@ async def _prepare_concurrent(
 def _continue_job_ids(first: int) -> None:
     global job_counter
     job_counter = itertools.count(first)
+
+
+def _prepared_job_ids() -> Callable[[], str]:
+    """`run_batch`'s take_job_id after `_prepare_concurrent`: the ids its seeds
+    were filed under, in the order it prepared them, which is the order
+    `run_batch` draws them in."""
+    ids = iter([PREPARED[index]["job_id"] for index in sorted(PREPARED)])
+    return lambda: next(ids)
 
 
 async def _run_cold_phase_isolated(
@@ -1026,7 +1046,10 @@ async def main():
             flush_between=flush_between,
             set_next_job_id=_continue_job_ids,
             max_concurrency=CONCURRENCY,
-            take_job_id=lambda: str(next(job_counter)),
+            take_job_id=(
+                _prepared_job_ids() if CONCURRENCY > 1
+                else lambda: str(next(job_counter))
+            ),
         )
         warm_rows = batch["rows"]
 
