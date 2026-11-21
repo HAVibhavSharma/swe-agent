@@ -6,6 +6,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.runnables import RunnableConfig
 from langgraph.constants import END, START
 from langgraph.prebuilt import ToolNode
+from agent.tools.sleep import make_tool_node
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph
 
@@ -52,7 +53,7 @@ research_tools = search_tools + codemap_tools
 # back to it as an error message to recover from. ToolNode's default re-raises
 # anything but a bad-arguments error, so one FileNotFoundError ended the whole
 # instance.
-tool_node = ToolNode(codemap_tools+search_tools, messages_key="implementation_research_scratchpad", handle_tool_errors=tool_error_message)
+tool_node = make_tool_node(codemap_tools+search_tools, messages_key="implementation_research_scratchpad", handle_tool_errors=tool_error_message)
 
 class ComeUpWithResearchNextStepOutput(TypedDict):
     research_next_step: str
