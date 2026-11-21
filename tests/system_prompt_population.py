@@ -136,7 +136,7 @@ _PATTERN_KEYS = (
 ).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _seed_agent_id(namespace: str, node: str) -> str:
+def _seed_agent_id(namespace: str, node: str, job_id: str | None = None) -> str:
     """The registry key a seed is filed under, the same scheme as ODR's.
 
     The seeding phase knows nodes by their bare runtime name, while live
@@ -155,9 +155,20 @@ def _seed_agent_id(namespace: str, node: str) -> str:
     Requires a server with pattern keys, which answers ``pattern_agent_ids:
     true``; ``populate_*`` checks it, because a wildcard key on a server
     without them is a literal id nothing ever asks for.
+
+    ``job_id`` narrows the key to one job, ``{namespace}:{job}:**:{node}``:
+    an instance's seed when several instances are seeded before any runs
+    (`--max-concurrency`). Under ``*`` they share one key, a non-react seed
+    replaces the key's entries, and every job's warm loads the instance seeded
+    last -- on pitlane run swe_lite10_q4-6-9-10_20261121_183753 all four
+    questions' static warms staged Q10's prompts. Serially each instance is
+    seeded just before it runs, so ``*`` is right there, and it keeps the
+    server's pattern count (256) from growing with the batch.
     """
     if not _PATTERN_KEYS:
         return f"{namespace}:{node}"
+    if job_id is not None:
+        return f"{namespace}:{job_id}:**:{node}"
     return f"{namespace}:*:**:{node}"
 
 
@@ -763,11 +774,13 @@ async def populate_instance_prompts(
     prefill_on_miss: bool = True,
     record_to: Path | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     """Seed each node's prefix as far as this instance fixes it. Never raises.
 
     ``issue`` is the instance's problem statement, the content of the first
-    message the graph is started with.
+    message the graph is started with. ``job_id`` files the seeds under that
+    job alone (see `_seed_agent_id`); None, under every job.
 
     Run after the instance's workspace is materialized and before its first
     request. With ``prefill_on_miss`` each seed is computed once and LMCache
@@ -802,7 +815,7 @@ async def populate_instance_prompts(
                 node = seed["node"]
                 row: dict[str, Any] = {
                     "node": node,
-                    "agent_id": _seed_agent_id(namespace, node),
+                    "agent_id": _seed_agent_id(namespace, node, job_id),
                     "seed_messages": len(seed["messages"] or []),
                     "seed_chars": sum(len(str(m.get("content") or ""))
                                       for m in seed["messages"] or []),
