@@ -62,6 +62,16 @@ Environment
 ``SWE_PROMPT_SEEDS_SKIP``      comma-separated target nodes not to seed
 ``SWE_PROMPT_SEEDS_LOG_PATH``  explicit log path; otherwise derived from
                                ``LANGGRAPH_PREDICTION_LOG_DIR`` and the job id
+``SWE_PROMPT_SEEDS_PREFILL_URL``  base URL of a second vLLM engine, e.g.
+                               ``http://127.0.0.1:8200``. Each seed is sent
+                               there as a one-token chat completion instead of
+                               to ``/prefetch``: that engine computes it on its
+                               own GPU and its LMCache connector stores the KV,
+                               which the serving engine then loads from the
+                               shared LMCache when the real request arrives.
+                               The serving GPU does no seed work at all.
+``SWE_PROMPT_SEEDS_PREFILL_TIMEOUT``  seconds to wait for one such prefill
+                               (default 300)
 
 Each also reads its ``ODR_`` spelling when the ``SWE_`` one is unset, which is
 what pitlane sets.
@@ -98,6 +108,12 @@ logger = logging.getLogger(__name__)
 # extends, so the server prefills only the difference. Never on a node's own
 # thread -- rendering a prompt and the POST stay off the critical path.
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swe-seed")
+# With a prefill engine each POST waits for the prefill itself (seconds for a
+# long prompt), so one worker for every question would queue one question's
+# seed behind another's. One worker per job keeps each question's seeds in
+# order -- the extended seed after the one it extends -- and lets questions
+# run side by side. The /prefetch path returns at once and keeps the one.
+_JOB_EXECUTORS: dict[str, ThreadPoolExecutor] = {}
 
 _lock = threading.Lock()
 # (job, agent_id) -> digest of the last seed sent, so an unchanged prompt is
@@ -118,8 +134,26 @@ def enabled() -> bool:
     return (
         _env("PROMPT_SEEDS", "1") == "1"
         and vllm_agent_enabled()
-        and bool(vllm_agent_base_url())
+        and bool(vllm_agent_base_url() or prefill_url())
     )
+
+
+def prefill_url() -> str:
+    """The second engine seeds are computed on, or "" to send them to
+    ``/prefetch`` on the serving engine as before."""
+    return _env("PROMPT_SEEDS_PREFILL_URL").rstrip("/")
+
+
+def _executor(job_id: str | None) -> ThreadPoolExecutor:
+    if not prefill_url():
+        return _EXECUTOR
+    key = job_id or "_"
+    with _lock:
+        executor = _JOB_EXECUTORS.get(key)
+        if executor is None:
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"swe-seed-{key}")
+            _JOB_EXECUTORS[key] = executor
+        return executor
 
 
 def _env(name: str, default: str = "") -> str:
@@ -274,6 +308,48 @@ def _post(base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
     return json.loads(body) if body else {}
 
 
+def _post_prefill(url: str, messages: list[dict[str, Any]],
+                  tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Compute ``messages`` on the prefill engine: a one-token chat completion.
+
+    ``add_generation_prompt`` off, so the rendered prompt ends where the seed
+    ends and stays a prefix of the real request, which continues with the
+    node's closing messages and only then the assistant header. A plain
+    request, not a phantom: it takes vLLM's ordinary prefill path, whose
+    LMCache connector stores the computed blocks -- a phantom that misses
+    LMCache is finished without prefilling on this fork, and would store
+    nothing. The one generated token is thrown away.
+    """
+    from agent.common.model import MODEL_NAME
+
+    try:
+        timeout = float(_env("PROMPT_SEEDS_PREFILL_TIMEOUT") or 300.0)
+    except ValueError:
+        timeout = 300.0
+    body: dict[str, Any] = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "max_tokens": 1,
+        "temperature": 0,
+        "add_generation_prompt": False,
+    }
+    if tools:
+        body["tools"] = tools
+    req = request.Request(
+        url=f"{url}/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"prefill engine failed with HTTP {exc.code}: {detail}") from exc
+    return json.loads(raw) if raw else {}
+
+
 def _build_and_send(**kwargs: Any) -> None:
     """``_send_seed`` with LangSmith tracing off.
 
@@ -302,8 +378,9 @@ def _send_seed(
 ) -> None:
     """Render, dedupe, POST and log one seed. Runs on the executor; never raises."""
     try:
+        helper = prefill_url()
         base_url = vllm_agent_base_url()
-        if not base_url:
+        if not (helper or base_url):
             return
         resolved = {key: value() if callable(value) else value for key, value in inputs.items()}
         rendered = _prefix_template(prompt, history_key).invoke(resolved).to_messages()
@@ -341,10 +418,15 @@ def _send_seed(
     response: dict[str, Any] = {}
     failure: str | None = None
     try:
-        response = _post(base_url, payload)
+        if helper:
+            response = _post_prefill(helper, messages, wire_tools)
+        else:
+            response = _post(base_url, payload)
     except Exception as exc:  # noqa: BLE001
         failure = str(exc)[:500]
         logger.warning("Prompt seed %s failed for %s: %s", event, target, exc)
+    usage = (response.get("usage") or {}) if helper else {}
+    details = usage.get("prompt_tokens_details") or {}
     _emit(job_id, {
         "event": event,
         "job_id": job_id,
@@ -362,6 +444,11 @@ def _send_seed(
         "post_elapsed_ns": time.perf_counter_ns() - started,
         "scored": response.get("scored"),
         "submitted": response.get("submitted"),
+        # On a prefill engine: the prompt it computed and how much of it it
+        # already held (its GPU cache or LMCache), i.e. what was new work.
+        "prefill_url": helper or None,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "cached_tokens": details.get("cached_tokens"),
         "error": failure,
     })
 
@@ -403,7 +490,7 @@ def seed(
             key: list(value) if isinstance(value, list) else value
             for key, value in inputs.items()
         }
-        _EXECUTOR.submit(
+        _executor(job_id).submit(
             _build_and_send,
             event=event,
             producer_node=metadata.get("langgraph_node"),
