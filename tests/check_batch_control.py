@@ -174,6 +174,48 @@ async def main() -> int:
         except SystemExit:
             check(f"concurrent is rejected {why}", True)
 
+    # --start-at: named instances start that long after the batch, the rest at once.
+    check("--start-at parses", batch_control.parse_start_at("4:0.2, 2:0.1", len(SAMPLE), None)
+          == {4: 0.2, 2: 0.1})
+    check("--start-at empty is no delays", batch_control.parse_start_at(None, len(SAMPLE), None) == {})
+    for bad, only, why in (("9:1", None, "index outside the sample"), ("2", None, "no seconds"),
+                           ("2:-1", None, "negative seconds"), ("2:x", None, "seconds not a number"),
+                           ("2:1,2:3", None, "index named twice"), ("3:1", {2, 5}, "index not run")):
+        try:
+            batch_control.parse_start_at(bad, len(SAMPLE), only)
+            check(f"--start-at {bad!r} is rejected ({why})", False)
+        except SystemExit:
+            check(f"--start-at {bad!r} is rejected ({why})", True)
+
+    class Timed(Harness):
+        def __init__(self) -> None:
+            super().__init__()
+            self.t0 = asyncio.get_running_loop().time()
+            self.started: dict[int, float] = {}
+
+        async def run_one(self, instance, **kwargs):
+            self.started[kwargs["logical_job_index"]] = asyncio.get_running_loop().time() - self.t0
+            return await super().run_one(instance, **kwargs)
+
+    h = Timed()
+    out = await batch_control.run_batch(
+        SAMPLE[:4], completions_per_instance=1, run_one=h.run_one, max_concurrency=4,
+        take_job_id=lambda: str(next(h.counter)), start_at={3: 0.3, 1: 0.15},
+    )
+    early = [h.started[i] for i in (2, 4)]
+    check("start-at: the others start at once", max(early) < 0.05, str(h.started))
+    check("start-at: each named instance waits its delay",
+          0.15 <= h.started[1] < 0.25 and 0.3 <= h.started[3] < 0.4, str(h.started))
+    check("start-at: job ids still match a serial run",
+          sorted((i, j) for i, _, j in h.calls) == [(i, str(i)) for i in range(1, 5)], str(h.calls))
+    check("start-at: reported", out["start_at"] == {"1": 0.15, "3": 0.3}, str(out.get("start_at")))
+    try:
+        await batch_control.run_batch(SAMPLE, completions_per_instance=1, run_one=Harness().run_one,
+                                      start_at={2: 1.0})
+        check("start-at is rejected serially", False)
+    except SystemExit:
+        check("start-at is rejected serially", True)
+
     print(f"\n{'all checks passed' if not FAILURES else f'{len(FAILURES)} FAILED'}")
     return 1 if FAILURES else 0
 

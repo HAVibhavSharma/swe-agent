@@ -10,6 +10,9 @@ drives both workflows with the same flags:
 ``--hbm-flush-between-queries``  flush GPU HBM after every instance, not only
                                  before the first
 ``--max-concurrency``            run up to this many instances at once (default 1)
+``--start-at``                   with --max-concurrency above 1: hold named
+                                 instances back for some seconds after the batch
+                                 starts, e.g. ``9:60,6:120``
 
 An interrupt lands on an instance boundary: the first SIGINT/SIGTERM lets the
 instance in flight finish and stops there, so a resume picks up at the next
@@ -103,6 +106,38 @@ def parse_only_questions(
     return picked
 
 
+def parse_start_at(
+    value: str | None, sample_size: int, only_questions: set[int] | None
+) -> dict[int, float]:
+    """``--start-at "9:60,6:120"`` as ``{9: 60.0, 6: 120.0}``: seconds after the
+    batch starts at which each named instance may start (the rest start at 0).
+
+    Indices are the same 1-based ones as ``--only-questions``, so an arm can
+    reorder its questions without renumbering them.
+    """
+    if not value:
+        return {}
+    out: dict[int, float] = {}
+    for part in (p.strip() for p in value.split(",")):
+        if not part:
+            continue
+        index, sep, seconds = part.partition(":")
+        try:
+            i, delay = int(index), float(seconds)
+        except ValueError:
+            raise SystemExit(f"--start-at {value!r}: {part!r} is not INDEX:SECONDS")
+        if not sep or delay < 0 or delay != delay:
+            raise SystemExit(f"--start-at {value!r}: {part!r} is not INDEX:SECONDS with SECONDS >= 0")
+        if not 1 <= i <= sample_size:
+            raise SystemExit(f"--start-at: {i} outside the {sample_size}-instance sample")
+        if only_questions is not None and i not in only_questions:
+            raise SystemExit(f"--start-at: {i} is not one of --only-questions {sorted(only_questions)}")
+        if i in out:
+            raise SystemExit(f"--start-at {value!r}: {i} named twice")
+        out[i] = delay
+    return out
+
+
 RunOne = Callable[..., Awaitable[dict[str, Any]]]
 
 
@@ -119,6 +154,7 @@ async def run_batch(
     label: str = "warm",
     max_concurrency: int = 1,
     take_job_id: Callable[[], str] | None = None,
+    start_at: dict[int, float] | None = None,
 ) -> dict[str, Any]:
     """Run every selected instance ``completions_per_instance`` times, in order.
 
@@ -132,7 +168,14 @@ async def run_batch(
     Job ids are drawn from ``take_job_id`` in index order before any job starts
     (a subset uses the full-run ids, as serially), so they are the ids a serial
     run would have used and pinned replay still finds the recordings.
+
+    ``start_at`` (``parse_start_at``) holds instance ``i`` back until
+    ``start_at[i]`` seconds after the batch starts; the others start at once.
+    Only with ``max_concurrency`` above 1: serially there is nothing to
+    overlap. The delay runs before the instance takes a slot, so a held-back
+    instance does not keep a neighbour waiting.
     """
+    start_at = start_at or {}
     if max_concurrency < 1:
         raise SystemExit(f"--max-concurrency {max_concurrency}: must be 1 or more")
     if max_concurrency > 1 and flush_between:
@@ -141,6 +184,8 @@ async def run_batch(
         raise SystemExit("--hbm-flush-between-queries cannot be used with --max-concurrency above 1")
     if max_concurrency > 1 and completions_per_instance != 1:
         raise SystemExit("--max-concurrency above 1 needs --completions-per-instance 1")
+    if start_at and max_concurrency == 1:
+        raise SystemExit("--start-at needs --max-concurrency above 1")
     already_done, highest_job_id = read_completed_log(completed_log)
     if highest_job_id and set_next_job_id is not None:
         # Continue the numbering rather than restarting it: reusing an id
@@ -190,6 +235,11 @@ async def run_batch(
 
         async def one(index: int, instance: dict[str, Any], job_id: str | None) -> None:
             nonlocal started
+            delay = start_at.get(index, 0.0)
+            if delay > 0:
+                print(f"[{label}] {instance['instance_id']} (question {index}) "
+                      f"held back {delay:g} s", flush=True)
+                await asyncio.sleep(max(0.0, launch + delay - loop.time()))
             # Semaphore waiters wake in arrival order and the tasks are created
             # in index order, so instances start (and take job ids) in order.
             async with slots:
@@ -216,6 +266,7 @@ async def run_batch(
 
         try:
             ids = [job_id_for(index) for index, _ in pending]
+            launch = loop.time()
             tasks = [asyncio.create_task(one(index, instance, job_id))
                      for (index, instance), job_id in zip(pending, ids)]
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
@@ -232,6 +283,7 @@ async def run_batch(
             "between_query_flushes_ok": 0,
             "skipped_already_done": len(already_done),
             "max_concurrency": max_concurrency,
+            "start_at": {str(i): d for i, d in sorted(start_at.items())},
         }
 
     try:

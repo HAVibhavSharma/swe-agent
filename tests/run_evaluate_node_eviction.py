@@ -42,7 +42,7 @@ from agent.common.workspace import set_job_root
 
 try:
     # `python tests/run_evaluate_node_eviction.py` puts tests/ on sys.path...
-    from batch_control import parse_only_questions, read_completed_log, run_batch
+    from batch_control import parse_only_questions, parse_start_at, read_completed_log, run_batch
     from kv_metrics_reset import reset_kv_metrics
     from lmcache_l1_flush import flush_lmcache_l1
     from system_prompt_population import populate_instance_prompts, populate_system_prompts
@@ -57,7 +57,7 @@ try:
         problem_statement_message,
     )
 except ImportError:  # ...`python -m tests.run_evaluate_node_eviction` does not.
-    from tests.batch_control import parse_only_questions, read_completed_log, run_batch
+    from tests.batch_control import parse_only_questions, parse_start_at, read_completed_log, run_batch
     from tests.kv_metrics_reset import reset_kv_metrics
     from tests.lmcache_l1_flush import flush_lmcache_l1
     from tests.system_prompt_population import populate_instance_prompts, populate_system_prompts
@@ -441,6 +441,17 @@ def parse_args() -> argparse.Namespace:
             "is checked out and seeded before the first question, then HBM and "
             "L1 are flushed once; nothing is flushed between questions. Cannot "
             "be combined with --hbm-flush-between-queries."
+        ),
+    )
+    parser.add_argument(
+        "--start-at",
+        default=None,
+        help=(
+            "With --max-concurrency above 1: comma-separated INDEX:SECONDS "
+            "pairs, e.g. '9:60,6:120' -- question 9 starts 60 s and question 6 "
+            "120 s after the batch starts, every other question at once. "
+            "Indices as in --only-questions. Seeding and the flushes still run "
+            "for every question before the batch starts."
         ),
     )
     return parser.parse_args()
@@ -1025,6 +1036,9 @@ async def main():
             args.only_questions, len(selected), args.completions_per_instance
         )
         flush_between = args.hbm_flush_between_queries and not args.no_kv_metrics_reset
+        start_at = parse_start_at(args.start_at, len(selected), only_questions)
+        if start_at and CONCURRENCY == 1:
+            raise SystemExit("--start-at needs --max-concurrency above 1")
         if CONCURRENCY > 1:
             if flush_between:
                 # Refused here, before a minute per instance of seeding, rather
@@ -1046,6 +1060,7 @@ async def main():
             flush_between=flush_between,
             set_next_job_id=_continue_job_ids,
             max_concurrency=CONCURRENCY,
+            start_at=start_at,
             take_job_id=(
                 _prepared_job_ids() if CONCURRENCY > 1
                 else lambda: str(next(job_counter))
@@ -1062,6 +1077,7 @@ async def main():
             "sampled_instances": len(selected),
             "completions_per_instance": args.completions_per_instance,
             "max_concurrency": CONCURRENCY,
+            "start_at": batch.get("start_at", {}),
             "completed_runs": len(warm_rows),
             "failed_runs": sum(1 for row in warm_rows if not row["success"]),
             "empty_patch_runs": sum(1 for row in warm_rows if row["empty_patch"]),
