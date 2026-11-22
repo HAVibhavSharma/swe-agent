@@ -45,6 +45,7 @@ try:
     from batch_control import parse_only_questions, parse_start_at, read_completed_log, run_batch
     from kv_metrics_reset import reset_kv_metrics
     from lmcache_l1_flush import flush_lmcache_l1
+    from job_release import release_job
     from system_prompt_population import populate_instance_prompts, populate_system_prompts
     from swebench_instances import (
         append_prediction,
@@ -60,6 +61,7 @@ except ImportError:  # ...`python -m tests.run_evaluate_node_eviction` does not.
     from tests.batch_control import parse_only_questions, parse_start_at, read_completed_log, run_batch
     from tests.kv_metrics_reset import reset_kv_metrics
     from tests.lmcache_l1_flush import flush_lmcache_l1
+    from tests.job_release import release_job
     from tests.system_prompt_population import populate_instance_prompts, populate_system_prompts
     from tests.swebench_instances import (
         append_prediction,
@@ -102,6 +104,8 @@ INSTANCE_PROMPT_POPULATION_PATH = METRICS_DIR / "instance_prompt_population.json
 # One line per question: LMCache's L2 writes drained and L1 cleared before it
 # starts, when LMCACHE_L1_FLUSH_URL is set; see tests/lmcache_l1_flush.py.
 LMCACHE_L1_FLUSH_PATH = METRICS_DIR / "lmcache_l1_flush.jsonl"
+# One line per question that released something at its end (tests/job_release.py).
+JOB_RELEASE_PATH = METRICS_DIR / "job_release.jsonl"
 # Set by main() from the population flags: the per-instance seeding is part of
 # the population phase, on and off with it.
 INSTANCE_POPULATION: dict[str, Any] = {"enabled": False, "prefill_on_miss": True, "flush_hbm": True}
@@ -699,6 +703,9 @@ async def target(
             # them out, which on back-to-back jobs is long enough to crowd out
             # the job that replaced it.
             KV_FORECAST.end_job(job_id)
+            # Its staged warms and its demand: on a thread, so the questions
+            # running beside it are not held up, and only this job's.
+            await asyncio.to_thread(release_job, str(job_id), record_to=JOB_RELEASE_PATH)
             try:
                 final_state_snapshot = await graph.aget_state(config)
                 final_state = final_state_snapshot.values
