@@ -72,6 +72,26 @@ Environment
                                The serving GPU does no seed work at all.
 ``SWE_PROMPT_SEEDS_PREFILL_TIMEOUT``  seconds to wait for one such prefill
                                (default 300)
+``SWE_PROMPT_SEEDS_LOOKUP_URL``  the LMCache server's ``/lookup``, e.g.
+                               ``http://127.0.0.1:9000/lookup``. With it, a
+                               seed bound for the prefill engine is first
+                               tokenized there (``/tokenize``, no GPU work) and
+                               looked up in LMCache (nothing is loaded); if
+                               LMCache already holds all of it but fewer than
+                               ``SWE_PROMPT_SEEDS_MIN_NEW_TOKENS`` (default
+                               1024) tokens, it is not sent. Such a seed would
+                               compute almost nothing and read its whole
+                               prefix from disk to do it, beside the real
+                               calls reading theirs. A failed probe sends the
+                               seed as before.
+``SWE_PROMPT_SEEDS_AS_WARMS``  ``1`` names each seed sent to the prefill
+                               engine as a warm, request id
+                               ``prefetch::<agent_id>::seed-<hex>``, which
+                               reaches LMCache as ``chatcmpl-prefetch::...``.
+                               LMCache then treats it as it treats vLLM's
+                               phantoms: its loads queue behind real requests',
+                               the blocks it reads are retained, and DemandLRU
+                               tags them for the job and node it is for.
 
 Each also reads its ``ODR_`` spelling when the ``SWE_`` one is unset, which is
 what pitlane sets.
@@ -85,6 +105,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Sequence
@@ -142,6 +163,34 @@ def prefill_url() -> str:
     """The second engine seeds are computed on, or "" to send them to
     ``/prefetch`` on the serving engine as before."""
     return _env("PROMPT_SEEDS_PREFILL_URL").rstrip("/")
+
+
+def lookup_url() -> str:
+    """LMCache's ``/lookup``, or "" to send every seed without asking."""
+    return _env("PROMPT_SEEDS_LOOKUP_URL").rstrip("/")
+
+
+_DEFAULT_MIN_NEW_TOKENS = 1024
+
+
+def min_new_tokens() -> int:
+    """A seed LMCache already holds all but fewer than this many tokens of is
+    not sent."""
+    try:
+        return max(0, int(_env("PROMPT_SEEDS_MIN_NEW_TOKENS") or _DEFAULT_MIN_NEW_TOKENS))
+    except ValueError:
+        return _DEFAULT_MIN_NEW_TOKENS
+
+
+def as_warms() -> bool:
+    """Whether seeds go to the prefill engine named as warms."""
+    return _env("PROMPT_SEEDS_AS_WARMS", "0") == "1"
+
+
+def _seed_request_id(agent_id: str) -> str:
+    """A warm's id for LMCache (``prefetch::<agent>::...``), unique per seed:
+    the agent id carries the job and the target node, which DemandLRU reads."""
+    return f"prefetch::{agent_id}::seed-{uuid.uuid4().hex[:16]}"
 
 
 def _executor(job_id: str | None) -> ThreadPoolExecutor:
@@ -308,8 +357,52 @@ def _post(base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
     return json.loads(body) if body else {}
 
 
+def _post_json(url: str, body: dict[str, Any], timeout: float) -> dict[str, Any]:
+    req = request.Request(
+        url=url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{url} failed with HTTP {exc.code}: {detail[:300]}") from exc
+    return json.loads(raw) if raw else {}
+
+
+def _probe(helper: str, lookup: str, messages: list[dict[str, Any]],
+           tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """How many tokens the seed has, and how many of them LMCache holds.
+
+    The prefill engine tokenizes it exactly as its chat completion would
+    (same template, ``add_generation_prompt`` off, the same tools); LMCache
+    hashes those tokens as a vLLM lookup would and reports the prefix it
+    holds, loading nothing. ``{"tokens", "cached", "error"}``; on any
+    failure ``error`` is set and the seed is sent anyway.
+    """
+    from agent.common.model import MODEL_NAME
+
+    body: dict[str, Any] = {"model": MODEL_NAME, "messages": messages,
+                            "add_generation_prompt": False}
+    if tools:
+        body["tools"] = tools
+    try:
+        tokens = _post_json(f"{helper}/tokenize", body, timeout=30.0).get("tokens")
+        if not isinstance(tokens, list):
+            raise RuntimeError("/tokenize returned no tokens")
+        found = _post_json(lookup, {"token_ids": tokens}, timeout=10.0)
+        return {"tokens": len(tokens), "cached": int(found["cached_prefix_tokens"]),
+                "error": None}
+    except Exception as exc:  # noqa: BLE001 - a probe must never stop a seed
+        return {"tokens": None, "cached": None, "error": str(exc)[:300]}
+
+
 def _post_prefill(url: str, messages: list[dict[str, Any]],
-                  tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+                  tools: list[dict[str, Any]] | None,
+                  request_id: str | None = None) -> dict[str, Any]:
     """Compute ``messages`` on the prefill engine: a one-token chat completion.
 
     ``add_generation_prompt`` off, so the rendered prompt ends where the seed
@@ -318,7 +411,8 @@ def _post_prefill(url: str, messages: list[dict[str, Any]],
     request, not a phantom: it takes vLLM's ordinary prefill path, whose
     LMCache connector stores the computed blocks -- a phantom that misses
     LMCache is finished without prefilling on this fork, and would store
-    nothing. The one generated token is thrown away.
+    nothing. The one generated token is thrown away. ``request_id`` (with
+    ``SWE_PROMPT_SEEDS_AS_WARMS``) names it as a warm for LMCache.
     """
     from agent.common.model import MODEL_NAME
 
@@ -335,19 +429,12 @@ def _post_prefill(url: str, messages: list[dict[str, Any]],
     }
     if tools:
         body["tools"] = tools
-    req = request.Request(
-        url=f"{url}/v1/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    if request_id:
+        body["request_id"] = request_id
     try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"prefill engine failed with HTTP {exc.code}: {detail}") from exc
-    return json.loads(raw) if raw else {}
+        return _post_json(f"{url}/v1/chat/completions", body, timeout=timeout)
+    except RuntimeError as exc:
+        raise RuntimeError(f"prefill engine: {exc}") from exc
 
 
 def _build_and_send(**kwargs: Any) -> None:
@@ -418,14 +505,26 @@ def _send_seed(
     started = time.perf_counter_ns()
     response: dict[str, Any] = {}
     failure: str | None = None
-    try:
-        if helper:
-            response = _post_prefill(helper, messages, wire_tools)
-        else:
-            response = _post(base_url, payload)
-    except Exception as exc:  # noqa: BLE001
-        failure = str(exc)[:500]
-        logger.warning("Prompt seed %s failed for %s: %s", event, target, exc)
+    skipped: str | None = None
+    lookup = lookup_url() if helper else ""
+    probe: dict[str, Any] = (_probe(helper, lookup, messages, wire_tools) if lookup
+                             else {"tokens": None, "cached": None, "error": None})
+    request_id = _seed_request_id(agent_id) if helper and as_warms() else None
+    if (probe["error"] is None and probe["tokens"] is not None
+            and probe["tokens"] - probe["cached"] < min_new_tokens()):
+        # Nearly all of it is in LMCache already: the seed would compute a few
+        # hundred tokens and read the rest from disk to do so.
+        skipped = "cached"
+        request_id = None
+    else:
+        try:
+            if helper:
+                response = _post_prefill(helper, messages, wire_tools, request_id)
+            else:
+                response = _post(base_url, payload)
+        except Exception as exc:  # noqa: BLE001
+            failure = str(exc)[:500]
+            logger.warning("Prompt seed %s failed for %s: %s", event, target, exc)
     usage = (response.get("usage") or {}) if helper else {}
     details = usage.get("prompt_tokens_details") or {}
     _emit(job_id, {
@@ -453,6 +552,16 @@ def _send_seed(
         "prefill_url": helper or None,
         "prompt_tokens": usage.get("prompt_tokens"),
         "cached_tokens": details.get("cached_tokens"),
+        # SWE_PROMPT_SEEDS_LOOKUP_URL: the seed's tokens and the prefix
+        # LMCache held before it was sent; "cached" in `skipped` means it was
+        # not sent, as all but fewer than `min_new_tokens` were there.
+        "lookup_tokens": probe["tokens"],
+        "lookup_cached_tokens": probe["cached"],
+        "lookup_error": probe["error"],
+        "min_new_tokens": min_new_tokens() if lookup else None,
+        "skipped": skipped,
+        # SWE_PROMPT_SEEDS_AS_WARMS: the id it was sent under.
+        "request_id": request_id,
         "error": failure,
     })
 
