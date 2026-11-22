@@ -375,6 +375,7 @@ def _send_seed(
     history_key: str,
     tools: Sequence[Any] | None,
     issued_at_ns: int,
+    issued_at_unix: float | None = None,
 ) -> None:
     """Render, dedupe, POST and log one seed. Runs on the executor; never raises."""
     try:
@@ -441,6 +442,9 @@ def _send_seed(
         "seeded_from_messages": response.get("seeded_from_messages"),
         "prefill_on_miss": response.get("prefill_on_miss"),
         "issued_at_ns": issued_at_ns,
+        # Wall clock, so the harness can line a seed up with the request it
+        # predicted (vLLM's stats are in Unix time) and judge it.
+        "issued_at_unix": issued_at_unix,
         "post_elapsed_ns": time.perf_counter_ns() - started,
         "scored": response.get("scored"),
         "submitted": response.get("submitted"),
@@ -502,6 +506,7 @@ def seed(
             history_key=history_key,
             tools=tools,
             issued_at_ns=time.perf_counter_ns(),
+            issued_at_unix=time.time(),
         )
     except Exception:  # noqa: BLE001 - a seed must never fail the run
         logger.warning("Prompt seed %s: not issued for %s", event, target, exc_info=True)
