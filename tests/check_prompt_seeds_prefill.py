@@ -84,6 +84,11 @@ def main() -> int:
     from agent.graph import swe_agent
 
     check("the prefill URL is read, trailing slash dropped", prompt_seeds.prefill_url() == helper_url)
+    check("no seed priority unless asked", prompt_seeds.seed_priority() == 0)
+    # As pitlane sets it under data parallelism, where seeds share the serving
+    # engines with the real calls.
+    os.environ["ODR_PROMPT_SEEDS_PRIORITY"] = "1"
+    check("the seed priority is read", prompt_seeds.seed_priority() == 1)
     first, again, other = (prompt_seeds._executor("job-a"), prompt_seeds._executor("job-a"),
                            prompt_seeds._executor("job-b"))
     check("one seed worker per job with a prefill engine", first is again and first is not other
@@ -128,6 +133,8 @@ def main() -> int:
             problems.append("add_generation_prompt not off")
         if seed.get("model") != "fake-model":
             problems.append(f"model {seed.get('model')}")
+        if seed.get("priority") != 1:
+            problems.append(f"priority {seed.get('priority')}")
         later = [base.CHAT[i] for k, i in base.EVENTS[position + 1:] if k == "chat"
                  and base.CHAT[i]["messages"][: len(seed["messages"])] == seed["messages"]]
         if not later:
@@ -147,6 +154,8 @@ def main() -> int:
     check("rows name the prefill engine and its token counts",
           all(row["prefill_url"] == helper_url and row["prompt_tokens"] == 1234
               and row["cached_tokens"] == 1000 for row in rows))
+    check("rows record the priority each seed was sent at",
+          all(row["priority"] == 1 for row in rows))
 
     print(f"\n{len(PREFILLS)} prefills, {len(base.CHAT)} chat requests; "
           f"{'all checks passed' if not base.FAILURES else f'{len(base.FAILURES)} FAILED'}")

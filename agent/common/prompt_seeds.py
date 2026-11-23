@@ -70,8 +70,19 @@ Environment
                                which the serving engine then loads from the
                                shared LMCache when the real request arrives.
                                The serving GPU does no seed work at all.
+                               Under vLLM data parallelism it is the
+                               serving port itself: vLLM's load balancer
+                               sends each seed to whichever engine has the
+                               fewest requests waiting and running.
 ``SWE_PROMPT_SEEDS_PREFILL_TIMEOUT``  seconds to wait for one such prefill
                                (default 300)
+``SWE_PROMPT_SEEDS_PRIORITY``  vLLM ``priority`` of each seed sent to the
+                               prefill engine (unset or ``0``: not sent). For
+                               seeds that share an engine with real calls,
+                               which are sent at 0: under vLLM's priority
+                               policy a seed then never queues ahead of a real
+                               call, and is the first preempted. Needs the
+                               server's ``--scheduling-policy priority``.
 ``SWE_PROMPT_SEEDS_LOOKUP_URL``  the LMCache server's ``/lookup``, e.g.
                                ``http://127.0.0.1:9000/lookup``. With it, a
                                seed bound for the prefill engine is first
@@ -180,6 +191,14 @@ def min_new_tokens() -> int:
         return max(0, int(_env("PROMPT_SEEDS_MIN_NEW_TOKENS") or _DEFAULT_MIN_NEW_TOKENS))
     except ValueError:
         return _DEFAULT_MIN_NEW_TOKENS
+
+
+def seed_priority() -> int:
+    """The vLLM priority seeds go to the prefill engine at; 0 sends none."""
+    try:
+        return int(_env("PROMPT_SEEDS_PRIORITY") or 0)
+    except ValueError:
+        return 0
 
 
 def as_warms() -> bool:
@@ -431,6 +450,8 @@ def _post_prefill(url: str, messages: list[dict[str, Any]],
         body["tools"] = tools
     if request_id:
         body["request_id"] = request_id
+    if seed_priority():
+        body["priority"] = seed_priority()
     try:
         return _post_json(f"{url}/v1/chat/completions", body, timeout=timeout)
     except RuntimeError as exc:
@@ -562,6 +583,8 @@ def _send_seed(
         "skipped": skipped,
         # SWE_PROMPT_SEEDS_AS_WARMS: the id it was sent under.
         "request_id": request_id,
+        # SWE_PROMPT_SEEDS_PRIORITY: the vLLM priority it was sent at.
+        "priority": seed_priority() if helper and skipped is None else None,
         "error": failure,
     })
 
