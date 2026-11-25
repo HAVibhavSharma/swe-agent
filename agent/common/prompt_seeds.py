@@ -481,6 +481,19 @@ def _post_prefill(url: str, messages: list[dict[str, Any]],
         raise RuntimeError(f"prefill engine: {exc}") from exc
 
 
+def _question_ended(job_id: str | None) -> bool:
+    """Under question pinning, whether ``job_id``'s question has ended (it had
+    an engine and no longer has). Always False without pinning."""
+    from agent.common import dp_routing
+
+    return dp_routing.enabled() and job_id is not None and dp_routing.ended(job_id)
+
+
+def _finish_reason(response: dict[str, Any]) -> str | None:
+    choices = response.get("choices") or []
+    return choices[0].get("finish_reason") if choices and isinstance(choices[0], dict) else None
+
+
 def _dropped_reason(message: str) -> str | None:
     """Why a pinning server dropped a seed (HTTP 409 ``seed dropped: ...``),
     or None for any other failure."""
@@ -562,10 +575,16 @@ def _send_seed(
     failure: str | None = None
     skipped: str | None = None
     lookup = lookup_url() if helper else ""
-    probe: dict[str, Any] = (_probe(helper, lookup, messages, wire_tools) if lookup
+    ended = _question_ended(job_id)
+    probe: dict[str, Any] = (_probe(helper, lookup, messages, wire_tools) if lookup and not ended
                              else {"tokens": None, "cached": None, "error": None})
     request_id = _seed_request_id(agent_id) if helper and as_warms() else None
-    if (probe["error"] is None and probe["tokens"] is not None
+    if ended or _question_ended(job_id):
+        # Pinned questions only: it ended while this seed was being built or
+        # queued behind the question's earlier seeds. Its call never comes.
+        skipped = "dropped: its question ended"
+        request_id = None
+    elif (probe["error"] is None and probe["tokens"] is not None
             and probe["tokens"] - probe["cached"] < min_new_tokens()):
         # Nearly all of it is in LMCache already: the seed would compute a few
         # hundred tokens and read the rest from disk to do so.
@@ -585,6 +604,9 @@ def _send_seed(
             else:
                 failure = str(exc)[:500]
                 logger.warning("Prompt seed %s failed for %s: %s", event, target, exc)
+    if helper and not skipped and _finish_reason(response) == "abort":
+        # The server aborted it when its question was released.
+        skipped = "dropped: aborted, its question ended"
     usage = (response.get("usage") or {}) if helper else {}
     details = usage.get("prompt_tokens_details") or {}
     _emit(job_id, {

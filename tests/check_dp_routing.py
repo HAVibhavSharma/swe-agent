@@ -2,7 +2,8 @@
 
 Each question gets the engine with the fewest questions running when it
 starts, the server hears it before the question's first request, and the
-engine is freed when the question ends.
+engine is freed when the question ends, which the server hears with how it
+ended (``/v1/agents/job_end``).
 
     python tests/check_dp_routing.py
 """
@@ -24,7 +25,7 @@ _spec = importlib.util.spec_from_file_location("dp_routing", ROOT / "agent" / "c
 dp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dp)
 
-POSTS: list[tuple[str, str, int]] = []
+POSTS: list[tuple] = []
 FAILURES: list[str] = []
 
 
@@ -41,8 +42,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         url = urlsplit(self.path)
         q = parse_qs(url.query)
-        POSTS.append((url.path, q["job_id"][0], int(q["rank"][0])))
-        body = json.dumps({"job_id": q["job_id"][0], "rank": int(q["rank"][0]), "enabled": True}).encode()
+        if url.path.endswith("/job_end"):
+            POSTS.append((url.path, q["job_id"][0], q["status"][0], q.get("reason", [None])[0]))
+            body = json.dumps({"job_id": q["job_id"][0], "status": q["status"][0], "pinning": True,
+                               "aborted_seeds": [], "released_phantoms": []}).encode()
+        else:
+            POSTS.append((url.path, q["job_id"][0], int(q["rank"][0])))
+            body = json.dumps({"job_id": q["job_id"][0], "rank": int(q["rank"][0]), "enabled": True}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -66,13 +72,23 @@ def main() -> int:
         ("/v1/agents/dp_rank", "3", 0), ("/v1/agents/dp_rank", "5", 1)], str(POSTS[:4]))
     check("calls carry the header", dp.headers_for("3") == {"X-data-parallel-rank": "0"})
     dp.release("2")
-    check("a release frees the engine at the server", POSTS[-1] == ("/v1/agents/dp_rank", "2", -1))
+    check("a question that ends tells the server, done", POSTS[-1] == ("/v1/agents/job_end", "2", "done", None))
     check("the engine that lost a question takes the next", dp.assign("7") == 1)
     check("a released question carries no header", dp.headers_for("2") == {})
     rows = [json.loads(line) for line in log.read_text().splitlines()]
     check("every assignment and release is logged",
-          [r["event"] for r in rows] == ["assign"] * 4 + ["release", "assign"]
+          [r["event"] for r in rows] == ["assign"] * 4 + ["finish", "assign"]
           and rows[-1]["running_before"] == [2, 1], str(rows[-1]))
+    check("a released question counts as ended, a running one does not",
+          dp.ended("2") and not dp.ended("3") and not dp.ended("99"))
+    dp.assign("2")
+    check("a question assigned again is no longer ended", not dp.ended("2"))
+    dp.finish("2", "failed", "Trace miss (job=2 node=x)")
+    check("a failed question tells the server so, with why",
+          POSTS[-1] == ("/v1/agents/job_end", "2", "failed", "Trace miss (job=2 node=x)"))
+    last = [json.loads(line) for line in log.read_text().splitlines()][-1]
+    check("and logs it", last["event"] == "finish" and last["status"] == "failed"
+          and last["server"]["status"] == "failed", str(last))
     print(f"\n{'all checks passed' if not FAILURES else f'{len(FAILURES)} FAILED'}")
     return 1 if FAILURES else 0
 

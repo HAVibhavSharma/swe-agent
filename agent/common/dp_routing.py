@@ -17,7 +17,10 @@ With ``SWE_DP_PIN_ENGINES=<n>`` the agent places questions instead:
 
 Prompt seeds carry no rank: the server holds each until an engine has no
 agent call in flight and runs it there, and drops it if its target call
-arrives first (``prompt_seeds``). The placement of questions is the same rule
+arrives first (``prompt_seeds``). When a question ends, finished or failed,
+``finish`` goes out first: seeds of it not yet sent are not sent
+(``ended``), and the server aborts its phantoms and its seeds waiting,
+running or still on their way. The placement of questions is the same rule
 in every arm and reacts only to questions starting and ending, never to warms
 or seeds.
 
@@ -43,6 +46,7 @@ HEADER = "X-data-parallel-rank"
 
 _lock = threading.Lock()
 _rank_of: dict[str, int] = {}
+_ended: set[str] = set()
 
 
 def engines() -> int:
@@ -63,22 +67,28 @@ def rank_for(job_id: str | None) -> int | None:
         return _rank_of.get(str(job_id))
 
 
+def ended(job_id: str) -> bool:
+    """Whether ``job_id``'s question was released and not assigned again."""
+    with _lock:
+        return str(job_id) in _ended
+
+
 def headers_for(job_id: str | None) -> dict[str, str]:
     """The header a chat call of ``job_id`` carries, or {} when unpinned."""
     rank = rank_for(job_id)
     return {} if rank is None else {HEADER: str(rank)}
 
 
-def _server_url() -> str:
+def _server_url(path: str = "dp_rank") -> str:
     base = (os.getenv("OPENAI_BASE_URL") or "").rstrip("/")
-    return f"{base}/agents/dp_rank" if base else ""
+    return f"{base}/agents/{path}" if base else ""
 
 
-def _tell_server(job_id: str, rank: int) -> dict[str, Any]:
-    url = _server_url()
+def _post(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    url = _server_url(path)
     if not url:
         return {"error": "OPENAI_BASE_URL unset"}
-    query = parse.urlencode({"job_id": job_id, "rank": rank})
+    query = parse.urlencode({k: v for k, v in params.items() if v is not None})
     req = request.Request(f"{url}?{query}", data=b"", method="POST")
     try:
         with request.urlopen(req, timeout=10.0) as resp:
@@ -113,7 +123,8 @@ def assign(job_id: str) -> int | None:
             running[rank] += 1
         rank = running.index(min(running))
         _rank_of[job_id] = rank
-    answer = _tell_server(job_id, rank)
+        _ended.discard(job_id)
+    answer = _post("dp_rank", {"job_id": job_id, "rank": rank})
     if answer.get("error") or not answer.get("enabled", False):
         logger.warning("dp pin: job %s -> engine %d, but the server said %s", job_id, rank, answer)
     _record({"event": "assign", "job_id": job_id, "rank": rank, "running_before": running,
@@ -121,14 +132,29 @@ def assign(job_id: str) -> int | None:
     return rank
 
 
-def release(job_id: str) -> None:
-    """The question ended: free its engine for the next one."""
+def finish(job_id: str, status: str = "done", reason: str | None = None) -> None:
+    """The question ended, ``done`` or ``failed`` (with ``reason``): free its
+    engine for the next one and have the server end everything of it still
+    running there (``POST /v1/agents/job_end``: its seeds waiting, running or
+    on their way, and its phantoms). Its seeds not yet sent are not sent
+    (``ended``)."""
     if not enabled():
         return
     job_id = str(job_id)
     with _lock:
         rank = _rank_of.pop(job_id, None)
+        if rank is not None:
+            _ended.add(job_id)
     if rank is None:
         return
-    answer = _tell_server(job_id, -1)
-    _record({"event": "release", "job_id": job_id, "rank": rank, "at_unix": time.time(), "server": answer})
+    answer = _post("job_end", {"job_id": job_id, "status": status,
+                               "reason": (reason or None) and str(reason)[:500]})
+    if answer.get("error"):
+        logger.warning("dp pin: job %s ended (%s), but the server said %s", job_id, status, answer)
+    _record({"event": "finish", "job_id": job_id, "rank": rank, "status": status,
+             "reason": (reason or None) and str(reason)[:500], "at_unix": time.time(), "server": answer})
+
+
+def release(job_id: str) -> None:
+    """``finish`` for a question that ended normally."""
+    finish(job_id, "done")

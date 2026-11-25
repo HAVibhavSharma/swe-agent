@@ -167,6 +167,9 @@ def main() -> int:
         workspace.set_job_root(None)
     check("a seed's inputs are built in its question's checkout, not the shared one",
           seen == "/tmp/job-7-checkout", f"worker saw {seen!r}")
+    check("an aborted seed's response reads as aborted, and without pinning no question counts as ended",
+          prompt_seeds._finish_reason({"choices": [{"finish_reason": "abort"}]}) == "abort"
+          and prompt_seeds._finish_reason({}) is None and not prompt_seeds._question_ended("job-1"))
     vllm_409 = ('http://x/v1/chat/completions failed with HTTP 409: {"error":{"message":'
                 '"seed dropped: its call arrived","type":"SeedDropped","code":409}}')
     check("a pinning server's 409 reads as a dropped seed",

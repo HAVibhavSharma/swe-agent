@@ -701,6 +701,13 @@ async def target(
         except Exception as exc:
             stream_error = str(exc)
         finally:
+            # SWE_DP_PIN_ENGINES: first, with how the question ended, so the
+            # server ends its seeds and phantoms before the next question
+            # takes its engine.
+            await asyncio.to_thread(
+                dp_routing.finish, str(job_id),
+                "failed" if stream_error is not None else "done", stream_error,
+            )
             # Floor every key for this job and persist the transition counts.
             # In `finally` because a job that died still has to release its
             # blocks; otherwise they stay valuable until the age term decays
@@ -710,7 +717,6 @@ async def target(
             # Its staged warms and its demand: on a thread, so the questions
             # running beside it are not held up, and only this job's.
             await asyncio.to_thread(release_job, str(job_id), record_to=JOB_RELEASE_PATH)
-            await asyncio.to_thread(dp_routing.release, str(job_id))
             try:
                 final_state_snapshot = await graph.aget_state(config)
                 final_state = final_state_snapshot.values
