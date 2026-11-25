@@ -71,9 +71,15 @@ Environment
                                shared LMCache when the real request arrives.
                                The serving GPU does no seed work at all.
                                Under vLLM data parallelism it is the
-                               serving port itself: vLLM's load balancer
-                               sends each seed to whichever engine has the
-                               fewest requests waiting and running.
+                               serving port itself. With question pinning
+                               (the server's ``VLLM_AGENT_DP_PIN``) a seed
+                               waits there until an engine has no agent call
+                               in flight and runs on it; a seed whose target
+                               call arrives first, or whose question ends, is
+                               dropped (HTTP 409) and logged as skipped
+                               ``dropped: <reason>``. Each seed carries
+                               ``seed_issued_at``, the time it was issued, so
+                               the server can tell.
 ``SWE_PROMPT_SEEDS_PREFILL_TIMEOUT``  seconds to wait for one such prefill
                                (default 300)
 ``SWE_PROMPT_SEEDS_PRIORITY``  vLLM ``priority`` of each seed sent to the
@@ -421,7 +427,8 @@ def _probe(helper: str, lookup: str, messages: list[dict[str, Any]],
 
 def _post_prefill(url: str, messages: list[dict[str, Any]],
                   tools: list[dict[str, Any]] | None,
-                  request_id: str | None = None) -> dict[str, Any]:
+                  request_id: str | None = None,
+                  issued_at_unix: float | None = None) -> dict[str, Any]:
     """Compute ``messages`` on the prefill engine: a one-token chat completion.
 
     ``add_generation_prompt`` off, so the rendered prompt ends where the seed
@@ -431,7 +438,8 @@ def _post_prefill(url: str, messages: list[dict[str, Any]],
     LMCache connector stores the computed blocks -- a phantom that misses
     LMCache is finished without prefilling on this fork, and would store
     nothing. The one generated token is thrown away. ``request_id`` (with
-    ``SWE_PROMPT_SEEDS_AS_WARMS``) names it as a warm for LMCache.
+    ``SWE_PROMPT_SEEDS_AS_WARMS``) names it as a warm for LMCache, and
+    ``issued_at_unix`` tells a pinning server which calls came after it.
     """
     from agent.common.model import MODEL_NAME
 
@@ -450,12 +458,25 @@ def _post_prefill(url: str, messages: list[dict[str, Any]],
         body["tools"] = tools
     if request_id:
         body["request_id"] = request_id
+    if issued_at_unix is not None:
+        body["seed_issued_at"] = issued_at_unix
     if seed_priority():
         body["priority"] = seed_priority()
     try:
         return _post_json(f"{url}/v1/chat/completions", body, timeout=timeout)
     except RuntimeError as exc:
         raise RuntimeError(f"prefill engine: {exc}") from exc
+
+
+def _dropped_reason(message: str) -> str | None:
+    """Why a pinning server dropped a seed (HTTP 409 ``seed dropped: ...``),
+    or None for any other failure."""
+    if "HTTP 409" not in message:
+        return None
+    at = message.find("seed dropped: ")
+    if at < 0:
+        return None
+    return message[at + len("seed dropped: "):].split('"', 1)[0].strip() or "unknown"
 
 
 def _build_and_send(**kwargs: Any) -> None:
@@ -540,12 +561,17 @@ def _send_seed(
     else:
         try:
             if helper:
-                response = _post_prefill(helper, messages, wire_tools, request_id)
+                response = _post_prefill(helper, messages, wire_tools, request_id, issued_at_unix)
             else:
                 response = _post(base_url, payload)
         except Exception as exc:  # noqa: BLE001
-            failure = str(exc)[:500]
-            logger.warning("Prompt seed %s failed for %s: %s", event, target, exc)
+            dropped = _dropped_reason(str(exc))
+            if dropped is not None:
+                # The server held it for an idle GPU and gave up: not a failure.
+                skipped = f"dropped: {dropped}"
+            else:
+                failure = str(exc)[:500]
+                logger.warning("Prompt seed %s failed for %s: %s", event, target, exc)
     usage = (response.get("usage") or {}) if helper else {}
     details = usage.get("prompt_tokens_details") or {}
     _emit(job_id, {
@@ -576,6 +602,8 @@ def _send_seed(
         # SWE_PROMPT_SEEDS_LOOKUP_URL: the seed's tokens and the prefix
         # LMCache held before it was sent; "cached" in `skipped` means it was
         # not sent, as all but fewer than `min_new_tokens` were there.
+        # "dropped: <reason>" means a pinning server held it for an idle GPU
+        # and dropped it (`post_elapsed_ns` is then how long it waited).
         "lookup_tokens": probe["tokens"],
         "lookup_cached_tokens": probe["cached"],
         "lookup_error": probe["error"],
@@ -584,7 +612,7 @@ def _send_seed(
         # SWE_PROMPT_SEEDS_AS_WARMS: the id it was sent under.
         "request_id": request_id,
         # SWE_PROMPT_SEEDS_PRIORITY: the vLLM priority it was sent at.
-        "priority": seed_priority() if helper and skipped is None else None,
+        "priority": seed_priority() if helper and skipped != "cached" else None,
         "error": failure,
     })
 

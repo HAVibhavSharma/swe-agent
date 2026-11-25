@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.graph import swe_agent_builder
 from agent.common.model import MODEL_NAME, MODEL_PROVIDER
+from agent.common import dp_routing
 from agent.common.workspace import set_job_root
 
 try:
@@ -672,6 +673,9 @@ async def target(
         # nodes this job has not reached yet, so the policy can score a prefix
         # before it is first visited.
         KV_FORECAST.start_job(job_id)
+        # SWE_DP_PIN_ENGINES: this question's engine, named to the server
+        # before its first request so its warms follow its calls there.
+        await asyncio.to_thread(dp_routing.assign, str(job_id))
         try:
             async for part in graph.astream(
                 {"implementation_research_scratchpad": [problem_statement_message(instance)]},
@@ -706,6 +710,7 @@ async def target(
             # Its staged warms and its demand: on a thread, so the questions
             # running beside it are not held up, and only this job's.
             await asyncio.to_thread(release_job, str(job_id), record_to=JOB_RELEASE_PATH)
+            await asyncio.to_thread(dp_routing.release, str(job_id))
             try:
                 final_state_snapshot = await graph.aget_state(config)
                 final_state = final_state_snapshot.values

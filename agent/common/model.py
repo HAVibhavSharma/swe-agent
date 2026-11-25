@@ -28,7 +28,7 @@ import os
 from langchain.chat_models import init_chat_model
 from langchain_core.runnables import RunnableConfig
 
-from agent.common import trace_store
+from agent.common import dp_routing, trace_store
 from agent.common.configuration import Configuration
 from agent.common.llm_request_metadata import inject_langgraph_request_metadata
 
@@ -90,6 +90,9 @@ configurable_model = init_chat_model(
         # traffic goes through ChatOpenAI's *sync* client.
         "http_client",
         "http_async_client",
+        # SWE_DP_PIN_ENGINES: the question's vLLM data-parallel engine, as
+        # X-data-parallel-rank (agent/common/dp_routing.py).
+        "default_headers",
     ),
 )
 
@@ -148,6 +151,9 @@ def get_model_config(
         # supports stream_options.include_usage, so turn it back on.
         model_config["stream_usage"] = True
         model_config["extra_body"] = _extra_body(config)
+        headers = dp_routing.headers_for(model_config["extra_body"].get("job_id"))
+        if headers:
+            model_config["default_headers"] = headers
         seed = Configuration.from_runnable_config(config).seed
         if seed is not None:
             model_config["seed"] = seed

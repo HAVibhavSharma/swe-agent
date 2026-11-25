@@ -135,6 +135,8 @@ def main() -> int:
             problems.append(f"model {seed.get('model')}")
         if seed.get("priority") != 1:
             problems.append(f"priority {seed.get('priority')}")
+        if not isinstance(seed.get("seed_issued_at"), float):
+            problems.append(f"seed_issued_at {seed.get('seed_issued_at')!r}")
         later = [base.CHAT[i] for k, i in base.EVENTS[position + 1:] if k == "chat"
                  and base.CHAT[i]["messages"][: len(seed["messages"])] == seed["messages"]]
         if not later:
@@ -156,6 +158,13 @@ def main() -> int:
               and row["cached_tokens"] == 1000 for row in rows))
     check("rows record the priority each seed was sent at",
           all(row["priority"] == 1 for row in rows))
+
+    from agent.common import prompt_seeds
+    vllm_409 = ('http://x/v1/chat/completions failed with HTTP 409: {"error":{"message":'
+                '"seed dropped: its call arrived","type":"SeedDropped","code":409}}')
+    check("a pinning server's 409 reads as a dropped seed",
+          prompt_seeds._dropped_reason(vllm_409) == "its call arrived"
+          and prompt_seeds._dropped_reason("failed with HTTP 500: boom") is None)
 
     print(f"\n{len(PREFILLS)} prefills, {len(base.CHAT)} chat requests; "
           f"{'all checks passed' if not base.FAILURES else f'{len(base.FAILURES)} FAILED'}")
