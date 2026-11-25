@@ -159,7 +159,14 @@ def main() -> int:
     check("rows record the priority each seed was sent at",
           all(row["priority"] == 1 for row in rows))
 
-    from agent.common import prompt_seeds
+    from agent.common import prompt_seeds, workspace
+    workspace.set_job_root("/tmp/job-7-checkout")
+    try:
+        seen = prompt_seeds._submit("7", workspace.job_root).result(timeout=10)
+    finally:
+        workspace.set_job_root(None)
+    check("a seed's inputs are built in its question's checkout, not the shared one",
+          seen == "/tmp/job-7-checkout", f"worker saw {seen!r}")
     vllm_409 = ('http://x/v1/chat/completions failed with HTTP 409: {"error":{"message":'
                 '"seed dropped: its call arrived","type":"SeedDropped","code":409}}')
     check("a pinning server's 409 reads as a dropped seed",

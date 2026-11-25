@@ -116,6 +116,7 @@ what pitlane sets.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -228,6 +229,18 @@ def _executor(job_id: str | None) -> ThreadPoolExecutor:
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"swe-seed-{key}")
             _JOB_EXECUTORS[key] = executor
         return executor
+
+
+def _submit(job_id: str | None, fn: Any, /, **kwargs: Any) -> Any:
+    """Run ``fn`` on the job's seed worker in a copy of the caller's context.
+
+    A thread pool does not carry context variables over, and the job's
+    checkout is one (``workspace.set_job_root``): a callable input such as the
+    architect's repo tree, evaluated on the worker without it, walks the shared
+    ``./workspace_repo`` instead of this question's checkout, so with questions
+    at once the seed is a prefix of no request the question sends.
+    """
+    return _executor(job_id).submit(contextvars.copy_context().run, fn, **kwargs)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -654,7 +667,8 @@ def seed(
             key: list(value) if isinstance(value, list) else value
             for key, value in inputs.items()
         }
-        _executor(job_id).submit(
+        _submit(
+            job_id,
             _build_and_send,
             event=event,
             producer_node=metadata.get("langgraph_node"),
